@@ -7,7 +7,7 @@ import { join } from "node:path";
 import chalk from "chalk";
 import { callAgent, MAX_ARGV_CHARS } from "./agent.js";
 import { parseDispatches, formatDispatchMessage } from "./dispatch.js";
-import { type Config, timeoutFor, thinkingFor } from "./config.js";
+import { type Config, timeoutFor, thinkingFor, fullyQualify, roleOf } from "./config.js";
 import type { DispatchBlock, RunRecord } from "./types.js";
 import { parseCitations, verifyCitations, formatVerificationReport } from "./citations.js";
 
@@ -191,38 +191,46 @@ async function runDispatchesInParallel(
 ): Promise<DispatchResult[]> {
   // Run with bounded concurrency.
   const sem = new Semaphore(cfg.maxParallel);
+  // Build a set of valid roles for the active group, so we can warn on
+  // dispatches to roles that aren't part of this team.
+  const validRoles = new Set(cfg.activeGroup.specialists.map(id => roleOf(id, cfg.activeGroup.id)));
   const tasks = dispatches.map(d => sem.run(async () => {
-    const sessionKey = `agent:${d.agent}:${runId}`;
+    // d.agent comes from Producer's DISPATCH block as an unprefixed role
+    // (e.g. "architect"). Auto-prefix with the active group to get the
+    // OpenClaw-side agent id ("crimeos.architect"). Validate against the group.
+    const role = roleOf(d.agent, cfg.activeGroup.id);
+    if (!validRoles.has(role)) {
+      log("warn", `Producer dispatched to "${d.agent}" which is not a specialist of group ${cfg.activeGroup.id}. Attempting anyway.`);
+    }
+    const qualifiedAgentId = fullyQualify(role, cfg.activeGroup.id);
+    const sessionKey = `agent:${qualifiedAgentId}:${runId}`;
     const msg = formatDispatchMessage(d);
-    const baseTimeout = timeoutFor(cfg, d.agent);
-    const taskLabel = `${d.agent}: ${d.task.slice(0, 60)}${d.task.length > 60 ? "…" : ""}`;
+    const baseTimeout = timeoutFor(cfg, qualifiedAgentId);
+    const taskLabel = `${role}: ${d.task.slice(0, 60)}${d.task.length > 60 ? "…" : ""}`;
 
     // Attempt 1
     let spin = startSpinner(taskLabel);
     let r = await callAgent({
-      agentId: d.agent,
+      agentId: qualifiedAgentId,
       sessionKey,
       message: msg,
       timeoutSec: baseTimeout,
-      thinkingLevel: thinkingFor(cfg, d.agent),
+      thinkingLevel: thinkingFor(cfg, qualifiedAgentId),
     });
     spin.stop(r.ok ? "ok" : "fail", r.durationMs);
 
     // Attempt 2 — auto-retry on timeout-only failures (exitCode === -1).
-    // Reuses the same session so the agent picks up where it left off if it
-    // had partial state. Bumps the timeout by 1.5×. Doesn't retry on errors
-    // we know won't fix themselves with more time (auth, missing model, etc.).
     if (!r.ok && r.exitCode === -1) {
       const bumpedTimeout = Math.round(baseTimeout * 1.5);
-      log("warn", `${d.agent} timed out at ${(r.durationMs/1000).toFixed(0)}s. Retrying once with ${bumpedTimeout}s budget…`);
+      log("warn", `${role} timed out at ${(r.durationMs/1000).toFixed(0)}s. Retrying once with ${bumpedTimeout}s budget…`);
       const resumeMsg = `Continue your prior reply. You were interrupted by timeout. If you'd already produced your DELIVERABLE, repeat it; if you were mid-investigation, finish and produce the DELIVERABLE now.`;
       spin = startSpinner(`${taskLabel} (retry)`);
       r = await callAgent({
-        agentId: d.agent,
+        agentId: qualifiedAgentId,
         sessionKey,
         message: resumeMsg,
         timeoutSec: bumpedTimeout,
-        thinkingLevel: thinkingFor(cfg, d.agent),
+        thinkingLevel: thinkingFor(cfg, qualifiedAgentId),
       });
       spin.stop(r.ok ? "ok" : "fail", r.durationMs);
     }
@@ -240,16 +248,16 @@ async function runDispatchesInParallel(
           finalReply = r.text + "\n" + report;
           const bad = verified.filter(v => v.status === "file-not-found" || v.status === "line-out-of-range").length;
           const ambig = verified.filter(v => v.status === "ambiguous-basename").length;
-          if (bad > 0)        log("warn", `${d.agent}: ${bad}/${verified.length} citation(s) unverified`);
-          else if (ambig > 0) log("info", `${d.agent}: ${verified.length} citation(s) checked (${ambig} ambiguous, 0 unverified)`);
-          else                log("ok",   `${d.agent}: ${verified.length}/${verified.length} citation(s) verified`);
+          if (bad > 0)        log("warn", `${role}: ${bad}/${verified.length} citation(s) unverified`);
+          else if (ambig > 0) log("info", `${role}: ${verified.length} citation(s) checked (${ambig} ambiguous, 0 unverified)`);
+          else                log("ok",   `${role}: ${verified.length}/${verified.length} citation(s) verified`);
         }
       }
     }
 
-    if (verbose && r.ok) log("trace", `${d.agent} reply:\n${finalReply}\n`);
-    if (!r.ok) log("warn", `${d.agent} failed: ${r.text.split("\n")[0]}`);
-    return { agent: d.agent, reply: finalReply, ok: r.ok, durationMs: r.durationMs };
+    if (verbose && r.ok) log("trace", `${role} reply:\n${finalReply}\n`);
+    if (!r.ok) log("warn", `${role} failed: ${r.text.split("\n")[0]}`);
+    return { agent: role, reply: finalReply, ok: r.ok, durationMs: r.durationMs };
   }));
   return Promise.all(tasks);
 }

@@ -180,7 +180,13 @@ async fn cancel_run(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
 #[tauri::command]
 fn list_runs() -> Result<Vec<RunSummary>, String> {
     let root = orchestrator_root();
-    let runs_dir = root.join("runs");
+    // Scope to the active group's run dir: runs/<group-id>/
+    let group_id = active_group_id().unwrap_or_else(|_| String::new());
+    let runs_dir = if group_id.is_empty() {
+        root.join("runs")
+    } else {
+        root.join("runs").join(&group_id)
+    };
     if !runs_dir.exists() {
         return Ok(vec![]);
     }
@@ -207,14 +213,117 @@ fn list_runs() -> Result<Vec<RunSummary>, String> {
 #[tauri::command]
 fn get_run(run_id: String) -> Result<serde_json::Value, String> {
     let root = orchestrator_root();
-    let path = root.join("runs").join(format!("{run_id}.json"));
-    let txt = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
-    serde_json::from_str(&txt).map_err(|e| format!("parse {path:?}: {e}"))
+    let group_id = active_group_id().unwrap_or_else(|_| String::new());
+    // Try the group-scoped path first, fall back to flat for legacy records.
+    let candidates: Vec<PathBuf> = if group_id.is_empty() {
+        vec![root.join("runs").join(format!("{run_id}.json"))]
+    } else {
+        vec![
+            root.join("runs").join(&group_id).join(format!("{run_id}.json")),
+            root.join("runs").join(format!("{run_id}.json")),
+        ]
+    };
+    for path in &candidates {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            return serde_json::from_str(&txt).map_err(|e| format!("parse {path:?}: {e}"));
+        }
+    }
+    Err(format!("run not found in any of: {candidates:?}"))
 }
 
 #[tauri::command]
 fn orchestrator_path() -> String {
     orchestrator_root().to_string_lossy().to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Groups (Phase A multi-project plumbing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Group {
+    id: String,
+    display_name: String,
+    emoji: String,
+    workspace: String,
+    producer_agent_id: String,
+    specialists: Vec<String>,
+    created_at: String,
+    last_used_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GroupsFile {
+    active_group_id: String,
+    groups: Vec<Group>,
+}
+
+fn groups_file_path() -> PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    PathBuf::from(home).join(".crime-team").join("groups.json")
+}
+
+fn read_groups_file() -> Result<GroupsFile, String> {
+    let path = groups_file_path();
+    let txt = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {path:?}: {e} — Phase A migration may not have run"))?;
+    serde_json::from_str(&txt).map_err(|e| format!("parse {path:?}: {e}"))
+}
+
+fn write_groups_file(file: &GroupsFile) -> Result<(), String> {
+    let path = groups_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let pretty = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+fn active_group_id() -> Result<String, String> {
+    read_groups_file().map(|f| f.active_group_id)
+}
+
+fn active_group() -> Result<Group, String> {
+    let file = read_groups_file()?;
+    file.groups.iter()
+        .find(|g| g.id == file.active_group_id)
+        .cloned()
+        .ok_or_else(|| format!("active group '{}' not found in groups.json", file.active_group_id))
+}
+
+#[tauri::command]
+fn groups_list() -> Result<GroupsFile, String> {
+    read_groups_file()
+}
+
+#[tauri::command]
+fn groups_get_active() -> Result<Group, String> {
+    active_group()
+}
+
+#[tauri::command]
+fn groups_set_active(group_id: String) -> Result<(), String> {
+    let mut file = read_groups_file()?;
+    if !file.groups.iter().any(|g| g.id == group_id) {
+        return Err(format!("group '{group_id}' not found"));
+    }
+    file.active_group_id = group_id;
+    // Update lastUsedAt on the now-active group.
+    let now = chrono_now_iso();
+    if let Some(g) = file.groups.iter_mut().find(|g| g.id == file.active_group_id) {
+        g.last_used_at = now;
+    }
+    write_groups_file(&file)
+}
+
+/// Minimal ISO-8601 timestamp without pulling in chrono. Uses UTC.
+fn chrono_now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Just emit "unix:<n>" — the GUI reformats. We don't need millisecond precision.
+    format!("unix:{secs}")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,11 +390,15 @@ async fn settings_get() -> Result<SettingsSnapshot, String> {
     let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
     let agents_v: serde_json::Value = serde_json::from_str(&agents_json)
         .map_err(|e| format!("parse agents.list: {e}"))?;
+    let active_id = active_group_id().unwrap_or_else(|_| String::new());
+    let group_prefix = if active_id.is_empty() { String::new() } else { format!("{active_id}.") };
     let mut agents = Vec::new();
     if let Some(list) = agents_v.as_array() {
         for a in list {
             let id = a.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
             if id.is_empty() || id == "main" { continue; }
+            // Scope to the active group: only agents whose id starts with "<group>." are part of this team.
+            if !group_prefix.is_empty() && !id.starts_with(&group_prefix) { continue; }
             // model can be a string OR an object { primary, fallbacks }
             let (primary, fallbacks) = match a.get("model") {
                 Some(serde_json::Value::String(s)) => (s.clone(), vec![]),
@@ -320,12 +433,19 @@ async fn settings_get() -> Result<SettingsSnapshot, String> {
             }
         }
     }
-    // Per-agent thinking levels live in our own .crime-team.json — not in
-    // OpenClaw's agents.list (no schema slot for it there).
+    // Per-agent thinking levels live in our own .crime-team.json — scoped
+    // by active group: perGroupThinking.<groupId>.<role> = "high".
     let ct = read_crime_team_json();
-    if let Some(map) = ct.get("perAgentThinking").and_then(|m| m.as_object()) {
+    let role_map = ct
+        .get("perGroupThinking")
+        .and_then(|m| m.as_object())
+        .and_then(|g| g.get(&active_id))
+        .and_then(|m| m.as_object());
+    if let Some(map) = role_map {
         for a in agents.iter_mut() {
-            if let Some(v) = map.get(&a.id).and_then(|v| v.as_str()) {
+            // a.id is fully-qualified; map keys are roles (unprefixed).
+            let role = a.id.strip_prefix(&group_prefix).unwrap_or(&a.id);
+            if let Some(v) = map.get(role).and_then(|v| v.as_str()) {
                 a.thinking = v.to_string();
             }
         }
@@ -346,8 +466,12 @@ async fn settings_add_provider(provider: String, profile_id: String, api_key: St
     // be empty and openclaw would re-prompt.
     let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
     let src = std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("main").join("agent").join("auth-profiles.json");
-    for agent in &["producer", "architect", "frontend", "art-director", "qa"] {
-        let dest = std::path::PathBuf::from(&home).join(".openclaw").join("agents").join(agent).join("auth-profiles.json");
+    // Mirror into every agent of the active group.
+    let group = active_group()?;
+    let mut all_ids = group.specialists.clone();
+    all_ids.push(group.producer_agent_id.clone());
+    for agent_id in &all_ids {
+        let dest = std::path::PathBuf::from(&home).join(".openclaw").join("agents").join(agent_id).join("auth-profiles.json");
         let _ = std::fs::copy(&src, &dest);
     }
     Ok(())
@@ -409,21 +533,37 @@ fn write_crime_team_json(v: &serde_json::Value) -> Result<(), String> {
     std::fs::write(crime_team_json_path(), pretty).map_err(|e| format!("write .crime-team.json: {e}"))
 }
 
-/// Set or clear an agent's thinking-level override in .crime-team.json.
-/// Pass "" to remove the override (revert to provider default).
+/// Set or clear an agent's thinking-level override in .crime-team.json,
+/// scoped under the active group (perGroupThinking.<groupId>.<role>).
+/// agent_id may be fully-qualified ("crimeos.architect") or just the role.
 #[tauri::command]
 async fn settings_set_agent_thinking(agent_id: String, thinking: String) -> Result<(), String> {
     const VALID: &[&str] = &["", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"];
     if !VALID.contains(&thinking.as_str()) {
         return Err(format!("invalid thinking level '{thinking}' — valid: {VALID:?}"));
     }
+    let group_id = active_group_id()?;
+    // Strip the group prefix if present, so the storage key is just the role.
+    let prefix = format!("{group_id}.");
+    let role = agent_id.strip_prefix(&prefix).unwrap_or(&agent_id).to_string();
+
     let mut cfg = read_crime_team_json();
     if !cfg.is_object() { cfg = serde_json::json!({}); }
     let obj = cfg.as_object_mut().unwrap();
-    let entry = obj.entry("perAgentThinking".to_string()).or_insert_with(|| serde_json::json!({}));
-    let map = entry.as_object_mut().ok_or("perAgentThinking is not an object")?;
-    if thinking.is_empty() { map.remove(&agent_id); }
-    else { map.insert(agent_id, serde_json::Value::String(thinking)); }
+    let group_thinking_root = obj
+        .entry("perGroupThinking".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let group_map = group_thinking_root
+        .as_object_mut()
+        .ok_or("perGroupThinking is not an object")?;
+    let role_map_entry = group_map
+        .entry(group_id.clone())
+        .or_insert_with(|| serde_json::json!({}));
+    let role_map = role_map_entry
+        .as_object_mut()
+        .ok_or_else(|| format!("perGroupThinking.{group_id} is not an object"))?;
+    if thinking.is_empty() { role_map.remove(&role); }
+    else { role_map.insert(role, serde_json::Value::String(thinking)); }
     write_crime_team_json(&cfg)
 }
 
@@ -437,14 +577,17 @@ async fn settings_restart_gateway() -> Result<(), String> {
 #[tauri::command]
 async fn settings_remove_provider(profile_id: String) -> Result<(), String> {
     let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
-    let paths = [
+    // Build the path list dynamically from the active group's agents (+ main).
+    let mut paths: Vec<PathBuf> = vec![
         std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("main").join("agent").join("auth-profiles.json"),
-        std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("producer").join("auth-profiles.json"),
-        std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("architect").join("auth-profiles.json"),
-        std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("frontend").join("auth-profiles.json"),
-        std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("art-director").join("auth-profiles.json"),
-        std::path::PathBuf::from(&home).join(".openclaw").join("agents").join("qa").join("auth-profiles.json"),
     ];
+    if let Ok(group) = active_group() {
+        let mut ids = group.specialists.clone();
+        ids.push(group.producer_agent_id.clone());
+        for id in ids {
+            paths.push(std::path::PathBuf::from(&home).join(".openclaw").join("agents").join(&id).join("auth-profiles.json"));
+        }
+    }
     let mut removed_anywhere = false;
     for path in &paths {
         if !path.exists() { continue; }
@@ -524,6 +667,9 @@ pub fn run() {
             settings_remove_provider,
             settings_test_provider,
             settings_set_agent_thinking,
+            groups_list,
+            groups_get_active,
+            groups_set_active,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

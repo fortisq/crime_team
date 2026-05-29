@@ -30,6 +30,7 @@ const els = {
   agents:      document.getElementById("agents"),
   runsList:    document.getElementById("runsList"),
   rootPath:    document.getElementById("rootPath"),
+  groupSelect: document.getElementById("groupSelect"),
   presetSelect:document.getElementById("presetSelect"),
   angleSelect: document.getElementById("angleSelect"),
 };
@@ -132,10 +133,22 @@ function startElapsedTimer() {
 }
 function stopElapsedTimer() { if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; } }
 
+// Active group cache. Loaded on startup + on every dropdown change.
+let activeGroup = null;
+let groupsList = null;
+
+/** Strip the active group's prefix from an agent id, if any. */
+function roleOf(agentId) {
+  if (!activeGroup) return agentId;
+  const prefix = activeGroup.id + ".";
+  return agentId.startsWith(prefix) ? agentId.slice(prefix.length) : agentId;
+}
+
 function emoji(agent) {
+  const role = roleOf(agent);
   return {
     producer: "🎬", architect: "🏛️", frontend: "🎨", "art-director": "🖼️", qa: "🔍", security: "🔐",
-  }[agent] ?? "🤖";
+  }[role] ?? "🤖";
 }
 
 function ensureAgentCard(name) {
@@ -631,7 +644,7 @@ function renderAgentsTable(agents) {
     const currentThinking = a.thinking ?? "";
     const initialLevels = thinkingLevelsFor(a.primary);
     tr.innerHTML = `
-      <td>${emoji(a.id)} ${escapeHtml(a.id)}</td>
+      <td>${emoji(a.id)} ${escapeHtml(roleOf(a.id))}</td>
       <td class="mono">${escapeHtml(a.primary || "(none)")}</td>
       <td>
         <select data-agent="${escapeHtml(a.id)}" data-field="primary">
@@ -796,10 +809,50 @@ els.smart?.addEventListener("change", () => {
   try { localStorage.setItem("ct.smart", els.smart.checked ? "1" : "0"); } catch {}
 });
 
+// --- Group switcher ---
+
+async function loadGroups() {
+  try {
+    const file = await invoke("groups_list");
+    groupsList = file.groups || [];
+    activeGroup = groupsList.find(g => g.id === file.activeGroupId) ?? groupsList[0] ?? null;
+    populateGroupSelect();
+  } catch (e) {
+    console.error("[groups] load failed:", e);
+  }
+}
+
+function populateGroupSelect() {
+  els.groupSelect.innerHTML = "";
+  for (const g of groupsList ?? []) {
+    const opt = document.createElement("option");
+    opt.value = g.id;
+    opt.textContent = `${g.emoji} ${g.displayName}`;
+    if (activeGroup && g.id === activeGroup.id) opt.selected = true;
+    els.groupSelect.appendChild(opt);
+  }
+}
+
+els.groupSelect?.addEventListener("change", async () => {
+  const newId = els.groupSelect.value;
+  if (!newId || (activeGroup && newId === activeGroup.id)) return;
+  try {
+    await invoke("groups_set_active", { groupId: newId });
+    activeGroup = groupsList.find(g => g.id === newId) ?? null;
+    // Reload everything scoped to the new active group
+    await refreshRuns();
+    document.querySelectorAll(".run-item.active").forEach(el => el.classList.remove("active"));
+    showSections({ status: false, log: false, answer: false });
+  } catch (e) {
+    console.error("[groups] set active failed:", e);
+  }
+});
+
 // Initial load
 (async () => {
   populatePresets();
   loadToggleState();
+  await loadGroups();        // populate dropdown FIRST so emoji() etc. know the active group
   try { els.rootPath.textContent = await invoke("orchestrator_path"); } catch {}
   await refreshRuns();
 })();

@@ -1,5 +1,26 @@
 // Shared types for the orchestrator.
 
+/**
+ * One project's team. Agents in OpenClaw are stored with fully-qualified ids
+ * (e.g. "crimeos.architect"); within the GUI and dispatch blocks we use the
+ * unprefixed role name ("architect"). The Group encodes the mapping.
+ */
+export interface Group {
+  id: string;                 // stable slug, used as agent-id prefix
+  displayName: string;
+  emoji: string;
+  workspace: string;          // absolute path
+  producerAgentId: string;    // fully-qualified, e.g. "crimeos.producer"
+  specialists: string[];      // fully-qualified ids, e.g. ["crimeos.architect", …]
+  createdAt: string;
+  lastUsedAt: string;
+}
+
+export interface GroupsFile {
+  activeGroupId: string;
+  groups: Group[];
+}
+
 /** A parsed DISPATCH block from Producer's output. */
 export interface DispatchBlock {
   agent: string;        // e.g. "architect", "frontend"
