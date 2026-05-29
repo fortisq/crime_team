@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+desktop/node_modules/
+
+# Build output
+dist/
+desktop/src-tauri/target/
+desktop/dist/
+*.tsbuildinfo
+
+# Local state — never commit
+runs/
+.crime-team.local.json
+*.log
+
+# Secrets — should never exist anyway; belt + suspenders
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/local/
+.idea/
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp

@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crime Team Orchestrator</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <header class="sidebar-header">
+          <h1>🦞 Crime Team</h1>
+          <button id="newRunBtn" class="primary small">New run</button>
+        </header>
+        <div class="runs-list" id="runsList">
+          <div class="empty">No runs yet.</div>
+        </div>
+        <footer class="sidebar-footer">
+          <div class="footer-row">
+            <div class="muted" id="rootPath"></div>
+            <button id="settingsBtn" class="gear" title="Settings">⚙</button>
+          </div>
+        </footer>
+      </aside>
+
+      <main class="main">
+        <section class="composer" id="composer">
+          <div class="presets-row">
+            <label class="preset-pick">
+              <span>Preset</span>
+              <select id="presetSelect">
+                <option value="">— Pick a preset —</option>
+              </select>
+            </label>
+            <label class="preset-pick">
+              <span>Angle</span>
+              <select id="angleSelect"></select>
+            </label>
+          </div>
+          <textarea
+            id="taskInput"
+            placeholder="Describe the task for the team. Or pick a preset above.&#10;&#10;Tip: Ctrl+Enter submits. The preset writes here; you can edit before running."
+            rows="8"
+          ></textarea>
+          <div class="composer-row">
+            <label class="check">
+              <input type="checkbox" id="verboseInput" checked />
+              <span>Verbose</span>
+            </label>
+            <label class="check" title="When on, Producer picks specialists per task instead of dispatching to all">
+              <input type="checkbox" id="smartDispatchInput" />
+              <span>Smart dispatch</span>
+            </label>
+            <label class="timeout">
+              <span>Timeout (s)</span>
+              <input type="number" id="timeoutInput" value="1800" min="60" step="60" />
+            </label>
+            <div class="composer-actions">
+              <button id="cancelBtn" class="danger" disabled>Cancel</button>
+              <button id="runBtn" class="primary">Run</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="status hidden" id="statusSection">
+          <div class="status-header">
+            <span id="phaseLabel" class="phase">idle</span>
+            <span id="elapsedTotal" class="muted"></span>
+            <span id="runIdLabel" class="muted right"></span>
+          </div>
+          <div class="agents" id="agents"></div>
+        </section>
+
+        <section class="log hidden" id="logSection">
+          <header class="log-header">
+            <span>Live log</span>
+            <button id="logToggleBtn" class="ghost small">collapse</button>
+          </header>
+          <pre id="logPre" class="log-pre"></pre>
+        </section>
+
+        <section class="answer hidden" id="answerSection">
+          <header class="answer-header">
+            <span>Producer's integrated answer</span>
+            <div class="answer-header-actions">
+              <button id="popoutAnswerBtn" class="ghost small" title="Open in a bigger resizable window">⛶ pop out</button>
+              <button id="copyAnswerBtn" class="ghost small">copy</button>
+            </div>
+          </header>
+          <article id="answerBody" class="answer-body"></article>
+        </section>
+      </main>
+    </div>
+
+    <!-- Settings modal -->
+    <div class="modal-backdrop hidden" id="settingsModal">
+      <div class="modal">
+        <header class="modal-header">
+          <h2>Settings</h2>
+          <button id="settingsCloseBtn" class="ghost small">✕</button>
+        </header>
+        <div class="modal-body">
+          <section class="settings-section">
+            <h3>Providers</h3>
+            <p class="muted">API keys are stored in <code>~/.openclaw/agents/main/agent/auth-profiles.json</code>.</p>
+            <table class="settings-table" id="providersTable">
+              <thead><tr><th>Profile</th><th>Provider</th><th>Type</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <details class="add-form">
+              <summary>Add a new provider key</summary>
+              <div class="form-grid">
+                <label><span>Provider</span>
+                  <select id="addProviderSelect">
+                    <option value="anthropic">anthropic</option>
+                    <option value="google">google</option>
+                    <option value="openrouter">openrouter</option>
+                    <option value="deepseek">deepseek</option>
+                    <option value="openai">openai</option>
+                    <option value="mistral">mistral</option>
+                    <option value="groq">groq</option>
+                    <option value="together">together</option>
+                    <option value="cerebras">cerebras</option>
+                  </select>
+                </label>
+                <label><span>Profile id</span>
+                  <input type="text" id="addProfileIdInput" placeholder="e.g. deepseek:main" />
+                </label>
+                <label class="full"><span>API key</span>
+                  <input type="password" id="addApiKeyInput" placeholder="sk-..." />
+                </label>
+              </div>
+              <div class="form-actions">
+                <button id="addProviderBtn" class="primary small">Add</button>
+                <span id="addProviderStatus" class="muted"></span>
+              </div>
+            </details>
+          </section>
+
+          <section class="settings-section">
+            <h3>Agents — primary model</h3>
+            <p class="muted">Each agent's <em>primary</em> model. Fallback chain is preserved automatically. Changes require a gateway restart.</p>
+            <table class="settings-table" id="agentsTable">
+              <thead><tr><th>Agent</th><th>Current</th><th>Set primary to</th><th>Thinking</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <p class="muted" style="margin-top:8px">
+              <strong>Thinking</strong> controls extended reasoning per agent — DeepSeek's thinking mode, Claude's extended thinking, OpenAI's reasoning effort. Higher = slower + more accurate on hard problems. Leave at <em>(default)</em> if unsure.
+            </p>
+          </section>
+        </div>
+        <footer class="modal-footer">
+          <span id="settingsStatus" class="muted"></span>
+          <div class="modal-footer-actions">
+            <button id="settingsCancelBtn" class="ghost">Cancel</button>
+            <button id="settingsApplyBtn" class="primary">Apply</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Popped-out answer modal -->
+    <div class="modal-backdrop hidden" id="answerModal">
+      <div class="modal modal-answer">
+        <header class="modal-header">
+          <h2>Producer's integrated answer</h2>
+          <div class="modal-header-actions">
+            <span id="answerModalSize" class="muted"></span>
+            <button id="answerModalCopyBtn" class="primary small">📋 Copy all</button>
+            <button id="answerModalCloseBtn" class="ghost small">✕</button>
+          </div>
+        </header>
+        <div class="modal-body answer-modal-body" id="answerModalBody"></div>
+        <div class="modal-resize-hint">drag corner to resize</div>
+      </div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

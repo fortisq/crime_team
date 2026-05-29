@@ -1,0 +1,10 @@
+{
+  "perAgentThinking": {
+    "architect": "high",
+    "art-director": "low",
+    "frontend": "medium",
+    "producer": "high",
+    "qa": "medium",
+    "security": "max"
+  }
+}
