@@ -318,6 +318,552 @@ fn groups_set_active(group_id: String) -> Result<(), String> {
     write_groups_file(&file)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Scan + propose flow
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    phase: &'static str,
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProposedSpecialist {
+    id: String,
+    emoji: String,
+    role: String,
+    reasoning: String,
+    suggested_model: String,
+    suggested_thinking: String,
+    system_prompt: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamProposal {
+    rationale: String,
+    specialists: Vec<ProposedSpecialist>,
+}
+
+/// Cap a string to `max_bytes`, appending a truncation marker if cut.
+fn cap(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes { return s.to_string(); }
+    let cut = max_bytes.saturating_sub(120);
+    let safe = match s.char_indices().take_while(|(i, _)| *i < cut).last() {
+        Some((i, c)) => i + c.len_utf8(),
+        None => 0,
+    };
+    format!("{}\n[…truncated by scan at {} chars; original was {} chars…]",
+            &s[..safe], cut, s.len())
+}
+
+fn read_capped(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| cap(&s, max_bytes))
+}
+
+/// List directory entries (depth 1) sorted, filtering noise.
+fn list_dir(path: &std::path::Path, max_entries: usize) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(path).ok().into_iter().flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { format!("{name}/") } else { name }
+        })
+        .filter(|n| {
+            let lower = n.to_lowercase();
+            !lower.starts_with('.') && !["node_modules/", "dist/", "build/", "target/", "out/", ".next/"]
+                .iter().any(|skip| lower == *skip)
+        })
+        .collect();
+    names.sort();
+    names.truncate(max_entries);
+    names
+}
+
+fn emit_scan(app: &AppHandle, phase: &'static str, detail: impl Into<String>) {
+    let _ = app.emit("scan:progress", ScanProgress { phase, detail: detail.into() });
+}
+
+/// Scan a workspace, build the meta-prompt per plan §6, ask the chosen model
+/// to propose a specialist team, and return the parsed/validated proposal.
+/// Emits "scan:progress" events as it goes so the GUI can show live status.
+#[tauri::command]
+async fn groups_scan_project(
+    app: AppHandle,
+    workspace: String,
+    display_name: String,
+    model: String,
+    thinking: String,
+) -> Result<TeamProposal, String> {
+    let ws_path = std::path::PathBuf::from(&workspace);
+    if !ws_path.exists() || !ws_path.is_dir() {
+        return Err(format!("workspace does not exist or is not a directory: {workspace}"));
+    }
+
+    // ─── 1. read context files ──────────────────────────────────────────────
+    emit_scan(&app, "reading", "scanning project files…");
+
+    // Project brief (CLAUDE.md or AGENTS.md). Cap 8KB.
+    let brief = ["CLAUDE.md", "AGENTS.md", "claude.md", "agents.md"].iter()
+        .find_map(|f| read_capped(&ws_path.join(f), 8000))
+        .unwrap_or_else(|| "(no project brief found)".to_string());
+    emit_scan(&app, "reading", format!("brief: {} chars", brief.len()));
+
+    // README.md. Cap 6KB.
+    let readme = read_capped(&ws_path.join("README.md"), 6000)
+        .unwrap_or_else(|| "(no README.md)".to_string());
+
+    // Stack manifests. Each capped small.
+    let manifests = ["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "Gemfile",
+                     "tsconfig.json", "next.config.ts", "next.config.mjs", "next.config.js",
+                     "tauri.conf.json", "vite.config.ts", "vite.config.js"]
+        .iter()
+        .filter_map(|f| read_capped(&ws_path.join(f), 2000).map(|c| format!("=== {f} ===\n{c}")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Top-level directory listing.
+    let top_level = list_dir(&ws_path, 80).join("\n  ");
+
+    // One level of key sub-dirs.
+    let key_subs = ["src", "app", "lib", "components", "scripts", "stdb", "stdb/spacetimedb",
+                    "stdb/spacetimedb/src", "src/components", "src/lib"];
+    let mut sub_listings: Vec<String> = Vec::new();
+    for sub in key_subs {
+        let p = ws_path.join(sub);
+        if p.is_dir() {
+            let entries = list_dir(&p, 60).join("\n  ");
+            if !entries.is_empty() {
+                sub_listings.push(format!("=== {sub}/ ===\n  {entries}"));
+            }
+        }
+    }
+    let sub_text = sub_listings.join("\n\n");
+
+    emit_scan(&app, "building-prompt", "composing meta-prompt…");
+
+    // ─── 2. build the meta-prompt (kept under ~22KB to fit argv) ────────────
+    // The example-prompt exemplar is the existing crime-os architect.md (truncated).
+    let exemplar_path = std::env::var("USERPROFILE").map(|h|
+        std::path::PathBuf::from(h).join(".openclaw").join("team-prompts").join("crimeos.architect.md")
+    ).map_err(|e| format!("USERPROFILE: {e}"))?;
+    let exemplar = read_capped(&exemplar_path, 3500).unwrap_or_else(|| String::new());
+
+    let mut prompt = String::with_capacity(20000);
+    prompt.push_str(&format!(
+"You are designing an agent team for a software project. Each team has a Producer (already chosen by Dan) plus 2-5 specialists tailored to THIS project. Propose only the specialists.\n\n\
+PROJECT INFO\n────────────\n\
+Display name: {display_name}\n\
+Workspace:    {workspace}\n\n\
+CONTEXT FILES\n─────────────\n\
+=== Project brief ===\n{brief}\n\n\
+=== README.md ===\n{readme}\n\n\
+{manifests}\n\n\
+=== Top-level structure ===\n  {top_level}\n\n\
+{sub_text}\n\n\
+"));
+
+    let exemplar_block = if !exemplar.is_empty() {
+        format!("EXAMPLE SYSTEM PROMPT (style template — do not copy literally, this is just to show structure and tone):\n\n{}\n\n", cap(&exemplar, 3000))
+    } else {
+        String::new()
+    };
+
+    prompt.push_str(&format!(
+"TASK\n────\nPropose 2-5 specialist agents tailored to THIS project. For each:\n  1. A short id (kebab-case, no spaces, 3-15 chars).\n  2. A one-word emoji.\n  3. A 1-sentence role description.\n  4. Why this project needs this role (cite paths or files from the context above).\n  5. Suggested model from: anthropic/claude-opus-4-7, anthropic/claude-sonnet-4-6, google/gemini-2.5-pro, google/gemini-2.5-flash, deepseek/deepseek-v4-pro, deepseek/deepseek-v4-flash, openrouter/google/gemma-4-31b-it:free\n  6. Suggested thinking level: off | low | medium | high | max\n  7. A complete system prompt for this agent (~1500-3000 chars). Include: role, owned domain (cite specific paths from the workspace), what to always read first, invariants, voice. NO scaffolding: do NOT include any 'Hey I just came online' opener or ask to be named.\n\n\
+{exemplar_block}\
+OUTPUT FORMAT (STRICT)\n──────────────────────\nReturn ONLY a JSON object — no prose before or after, optionally inside a single ```json code fence. Schema:\n\n\
+{{\n  \"rationale\": \"<1-2 sentences on why this team for this project>\",\n  \"specialists\": [\n    {{\n      \"id\": \"<id>\",\n      \"emoji\": \"<emoji>\",\n      \"role\": \"<1 sentence>\",\n      \"reasoning\": \"<why this project needs this role; cite paths>\",\n      \"suggestedModel\": \"<provider/model>\",\n      \"suggestedThinking\": \"off|low|medium|high|max\",\n      \"systemPrompt\": \"<full multi-paragraph prompt>\"\n    }}\n  ]\n}}\n\n\
+RULES\n─────\n- DO NOT include Producer; that role is fixed.\n- DO NOT propose more than 5 specialists.\n- DO NOT add a security specialist unless this project handles real user data, auth, payments, or multi-user state — most solo projects do not need one.\n- Match dispatched specialists to the actual scope of the work. A CLI tool may need only 2 agents. A game may need 4 or 5.\n- Specialist ids must be unique within this team and kebab-case.\n- Prefer cheap models (deepseek/deepseek-v4-pro, anthropic/claude-sonnet-4-6) unless a role really needs Opus.\n"
+    ));
+
+    emit_scan(&app, "calling-model", format!("calling {} ({} chars prompt)…", model, prompt.len()));
+
+    // ─── 3. call the model via openclaw infer ───────────────────────────────
+    // openclaw infer model run --local --model X --prompt Y. argv-limited.
+    // We cap to ~24KB total prompt to leave room for other args.
+    if prompt.len() > 24000 {
+        prompt.truncate(24000);
+        prompt.push_str("\n[…prompt truncated by scan at 24000 chars to fit argv…]");
+    }
+
+    let mut args: Vec<&str> = vec!["infer", "model", "run", "--local", "--model", &model, "--prompt", &prompt];
+    if !thinking.is_empty() && thinking != "off" {
+        args.push("--thinking");
+        args.push(&thinking);
+    }
+    let raw = run_openclaw(&args, None).await
+        .map_err(|e| format!("model call failed: {e}"))?;
+
+    emit_scan(&app, "parsing", "parsing team proposal…");
+
+    // ─── 4. extract + parse JSON ────────────────────────────────────────────
+    let json_text = extract_json_payload(&raw)
+        .ok_or_else(|| format!("model did not return parseable JSON. Raw output:\n{raw}"))?;
+    let mut proposal: TeamProposal = serde_json::from_str(&json_text)
+        .map_err(|e| format!("JSON parse failed: {e}. Extracted text:\n{}", cap(&json_text, 2000)))?;
+
+    // ─── 5. validate ────────────────────────────────────────────────────────
+    if proposal.specialists.is_empty() {
+        return Err("model proposed 0 specialists; expected 2-5".into());
+    }
+    if proposal.specialists.len() > 5 {
+        proposal.specialists.truncate(5);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for s in proposal.specialists.iter_mut() {
+        let id_ok = s.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !id_ok || s.id.is_empty() || s.id.len() > 20 {
+            return Err(format!("invalid specialist id '{}' — must be kebab-case ≤20 chars", s.id));
+        }
+        if !seen.insert(s.id.clone()) {
+            return Err(format!("duplicate specialist id '{}'", s.id));
+        }
+        if s.system_prompt.trim().len() < 200 {
+            return Err(format!("specialist '{}' has too-short systemPrompt ({} chars; need ≥200)", s.id, s.system_prompt.len()));
+        }
+        // Normalize thinking level
+        let t = s.suggested_thinking.to_lowercase();
+        s.suggested_thinking = match t.as_str() {
+            "off" | "low" | "medium" | "high" | "max" => t,
+            _ => "medium".to_string(),
+        };
+    }
+
+    emit_scan(&app, "done", format!("proposal received: {} specialist(s)", proposal.specialists.len()));
+    Ok(proposal)
+}
+
+/// Pull a JSON object from raw model output. Handles ```json fences, leading
+/// chatter, and trailing prose. Returns the inner JSON text only.
+fn extract_json_payload(raw: &str) -> Option<String> {
+    // Try a ```json … ``` fence first.
+    if let Some(start) = raw.find("```json") {
+        let after = &raw[start + 7..];
+        if let Some(end) = after.find("```") {
+            return Some(after[..end].trim().to_string());
+        }
+    }
+    if let Some(start) = raw.find("```") {
+        let after = &raw[start + 3..];
+        if let Some(end) = after.find("```") {
+            let inner = after[..end].trim();
+            if inner.starts_with('{') {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    // Fall back: find the first '{' that begins a balanced object.
+    let bytes = raw.as_bytes();
+    let mut start_idx: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, b) in bytes.iter().enumerate() {
+        if start_idx.is_none() {
+            if *b == b'{' { start_idx = Some(i); depth = 1; }
+            continue;
+        }
+        if esc { esc = false; continue; }
+        match *b {
+            b'\\' if in_str => esc = true,
+            b'"' => in_str = !in_str,
+            b'{' if !in_str => depth += 1,
+            b'}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(raw[start_idx.unwrap()..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// groups_create — bulk-add agents for a new team, atomic-ish with rollback
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSpec {
+    id: String,
+    emoji: String,
+    model: String,
+    thinking: String,
+    system_prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateGroupSpec {
+    id: String,             // group slug, e.g. "myproject"
+    display_name: String,
+    emoji: String,
+    workspace: String,
+    producer: AgentSpec,
+    specialists: Vec<AgentSpec>,
+}
+
+/// Create a new group: add agents in OpenClaw, write prompts, mirror auth,
+/// set identities, append to groups.json, write a starter presets.js,
+/// restart the gateway. Rolls back on any failure.
+#[tauri::command]
+async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, String> {
+    // ─── 1. validate ─────────────────────────────────────────────────────────
+    if spec.id.is_empty() || !spec.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("invalid group id '{}' — must be kebab-case", spec.id));
+    }
+    if !std::path::PathBuf::from(&spec.workspace).is_dir() {
+        return Err(format!("workspace not found: {}", spec.workspace));
+    }
+    let existing = read_groups_file().ok();
+    if let Some(ref f) = existing {
+        if f.groups.iter().any(|g| g.id == spec.id) {
+            return Err(format!("group '{}' already exists", spec.id));
+        }
+    }
+
+    let prefix = format!("{}.", spec.id);
+    let qualified_producer_id = format!("{}producer", prefix);
+    let specialist_ids: Vec<String> = spec.specialists.iter()
+        .map(|s| format!("{}{}", prefix, s.id))
+        .collect();
+    let all_ids: Vec<String> = std::iter::once(qualified_producer_id.clone())
+        .chain(specialist_ids.iter().cloned())
+        .collect();
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let home_path = std::path::PathBuf::from(&home);
+    let openclaw_root = home_path.join(".openclaw");
+    let agents_root = openclaw_root.join("agents");
+    let prompts_root = openclaw_root.join("team-prompts");
+    let ct_root = home_path.join(".crime-team");
+
+    emit_scan(&app, "creating", format!("creating {} agents…", all_ids.len()));
+
+    // Rollback tracking: collect created agent dirs + prompt files + config-patched ids.
+    let mut created_agent_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut created_prompt_files: Vec<std::path::PathBuf> = Vec::new();
+
+    // Closure: run rollback then return the error.
+    async fn rollback(
+        ids: &[String],
+        dirs: &[std::path::PathBuf],
+        prompts: &[std::path::PathBuf],
+    ) {
+        for id in ids {
+            let _ = run_openclaw(&["agents", "delete", id, "--yes"], None).await;
+        }
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        for p in prompts {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // ─── 2. add each agent ───────────────────────────────────────────────────
+    let auth_src = agents_root.join("main").join("agent").join("auth-profiles.json");
+
+    let make_specs = || -> Vec<(&AgentSpec, String, String)> {
+        // (spec, qualified_id, role_for_filename)
+        let mut v = Vec::new();
+        v.push((&spec.producer, qualified_producer_id.clone(), "producer".to_string()));
+        for (s, qid) in spec.specialists.iter().zip(specialist_ids.iter()) {
+            v.push((s, qid.clone(), s.id.clone()));
+        }
+        v
+    };
+
+    for (agent_spec, qid, role) in make_specs() {
+        let agent_dir = agents_root.join(&qid);
+        let agent_dir_str = agent_dir.to_string_lossy().to_string();
+        emit_scan(&app, "creating", format!("agents add {qid}"));
+        let r = run_openclaw(&[
+            "agents", "add", &qid,
+            "--non-interactive",
+            "--workspace", &spec.workspace,
+            "--model", &agent_spec.model,
+            "--agent-dir", &agent_dir_str,
+        ], None).await;
+        if let Err(e) = r {
+            rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+            return Err(format!("agents add {qid} failed: {e}"));
+        }
+        created_agent_dirs.push(agent_dir.clone());
+
+        // Mirror auth profiles
+        let auth_dest = agent_dir.join("auth-profiles.json");
+        let _ = std::fs::copy(&auth_src, &auth_dest);
+
+        // Write system prompt file
+        let prompt_file = prompts_root.join(format!("{}.{}.md", spec.id, role));
+        if let Err(e) = std::fs::write(&prompt_file, &agent_spec.system_prompt) {
+            rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+            return Err(format!("write prompt {prompt_file:?}: {e}"));
+        }
+        created_prompt_files.push(prompt_file);
+
+        // Set identity (display name + emoji)
+        let display = if role == "producer" { "Producer".to_string() } else { capitalize(&role) };
+        let _ = run_openclaw(&[
+            "agents", "set-identity",
+            "--agent", &qid,
+            "--name", &display,
+            "--emoji", &agent_spec.emoji,
+        ], None).await;
+    }
+
+    // ─── 3. patch agents.list to add systemPromptOverride + thinking is per-group .crime-team.json ──
+    // Re-read agents.list, find each new agent, set systemPromptOverride.
+    emit_scan(&app, "creating", "wiring system prompts…");
+    let list_json = run_openclaw(&["config", "get", "agents.list"], None).await
+        .map_err(|e| { format!("read agents.list: {e}") })?;
+    let mut list: serde_json::Value = serde_json::from_str(&list_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    if let Some(arr) = list.as_array_mut() {
+        for (agent_spec, qid, _role) in make_specs() {
+            for a in arr.iter_mut() {
+                if a.get("id").and_then(|v| v.as_str()) == Some(qid.as_str()) {
+                    if let Some(obj) = a.as_object_mut() {
+                        obj.insert("systemPromptOverride".to_string(),
+                                   serde_json::Value::String(agent_spec.system_prompt.clone()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    if let Err(e) = run_openclaw(
+        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+        Some(payload_s.as_bytes()),
+    ).await {
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        return Err(format!("patch agents.list: {e}"));
+    }
+
+    // ─── 4. write per-group thinking levels into .crime-team.json ────────────
+    let mut ct = read_crime_team_json();
+    if !ct.is_object() { ct = serde_json::json!({}); }
+    let obj = ct.as_object_mut().unwrap();
+    let group_thinking_root = obj.entry("perGroupThinking".to_string()).or_insert_with(|| serde_json::json!({}));
+    let role_map_entry = group_thinking_root.as_object_mut().unwrap().entry(spec.id.clone()).or_insert_with(|| serde_json::json!({}));
+    let role_map = role_map_entry.as_object_mut().unwrap();
+    if !spec.producer.thinking.is_empty() && spec.producer.thinking != "off" {
+        role_map.insert("producer".to_string(), serde_json::Value::String(spec.producer.thinking.clone()));
+    }
+    for s in &spec.specialists {
+        if !s.thinking.is_empty() && s.thinking != "off" {
+            role_map.insert(s.id.clone(), serde_json::Value::String(s.thinking.clone()));
+        }
+    }
+    if let Err(e) = write_crime_team_json(&ct) {
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        return Err(format!(".crime-team.json write: {e}"));
+    }
+
+    // ─── 5. write starter presets.js for this group ──────────────────────────
+    let group_dir = ct_root.join("groups").join(&spec.id);
+    let _ = std::fs::create_dir_all(&group_dir);
+    let presets_path = group_dir.join("presets.js");
+    let starter_presets = starter_presets_for_group(&spec);
+    let _ = std::fs::write(&presets_path, &starter_presets);
+
+    // ─── 6. append to groups.json + set active ───────────────────────────────
+    let now = chrono_now_iso();
+    let new_group = Group {
+        id: spec.id.clone(),
+        display_name: spec.display_name.clone(),
+        emoji: spec.emoji.clone(),
+        workspace: spec.workspace.clone(),
+        producer_agent_id: qualified_producer_id.clone(),
+        specialists: specialist_ids.clone(),
+        created_at: now.clone(),
+        last_used_at: now,
+    };
+    let mut groups_file = existing.unwrap_or(GroupsFile {
+        active_group_id: spec.id.clone(),
+        groups: Vec::new(),
+    });
+    groups_file.groups.push(new_group.clone());
+    groups_file.active_group_id = spec.id.clone();
+    if let Err(e) = write_groups_file(&groups_file) {
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        return Err(format!("write groups.json: {e}"));
+    }
+
+    // ─── 7. restart gateway ──────────────────────────────────────────────────
+    emit_scan(&app, "restarting", "restarting gateway…");
+    let _ = run_openclaw(&["gateway", "restart"], None).await;
+
+    emit_scan(&app, "done", format!("group '{}' created", spec.id));
+    Ok(new_group)
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+/// Generate a minimal starter presets.js for a new group with one universal preset.
+fn starter_presets_for_group(spec: &CreateGroupSpec) -> String {
+    let specialists_csv = spec.specialists.iter()
+        .map(|s| s.id.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+"// Preset library for the '{}' group. Edit freely; refresh GUI to pick up changes.\n\
+// Each preset is a labelled task prompt. See ~/.crime-team/groups/<other>/presets.js\n\
+// for more examples.\n\
+\n\
+export const PRESETS = [\n\
+  {{\n\
+    group: \"Combos\",\n\
+    items: [\n\
+      {{\n\
+        label: \"Universal Findings\",\n\
+        prompt:\n\
+`Do a read-only Findings pass on this system. No code changes. Judge it from two angles:\n\
+1. Will this hurt the user experience?\n\
+2. Will this slow development later?\n\n\
+Report only the highest-value findings. Ignore minor style issues unless they create real risk. Dispatch in parallel to all relevant specialists ({}). Synthesize into ONE integrated report.`\n\
+      }},\n\
+    ],\n\
+  }},\n\
+];\n\
+\n\
+export const ANGLES = [\n\
+  {{ label: \"(no extra angle)\", suffix: \"\" }},\n\
+  {{ label: \"Prioritize user pain over coding purity\", suffix: \"\\n\\nPrioritize findings by user pain, not coding purity.\" }},\n\
+  {{ label: \"Sort into ship-blocker / soon / later\", suffix: \"\\n\\nSeparate \\\"ship blocker,\\\" \\\"soon,\\\" and \\\"later.\\\"\" }},\n\
+];\n",
+        spec.display_name, specialists_csv
+    )
+}
+
+/// Open the OS folder picker. Returns the absolute path the user chose,
+/// or None if they cancelled.
+#[tauri::command]
+async fn groups_browse_directory(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |path| {
+        let _ = tx.send(path);
+    });
+    let picked = rx.await.map_err(|e| format!("dialog cancelled: {e}"))?;
+    Ok(picked.map(|p| p.to_string()))
+}
+
 /// Minimal ISO-8601 timestamp without pulling in chrono. Uses UTC.
 fn chrono_now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -670,6 +1216,9 @@ pub fn run() {
             groups_list,
             groups_get_active,
             groups_set_active,
+            groups_browse_directory,
+            groups_scan_project,
+            groups_create,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

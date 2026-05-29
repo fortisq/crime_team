@@ -11,6 +11,7 @@
       <aside class="sidebar">
         <header class="sidebar-header">
           <select id="groupSelect" class="group-select" title="Active project group"></select>
+          <button id="newGroupBtn" class="ghost small" title="Create a new project group">+</button>
           <button id="newRunBtn" class="primary small">New run</button>
         </header>
         <div class="runs-list" id="runsList">
@@ -155,6 +156,96 @@
           <div class="modal-footer-actions">
             <button id="settingsCancelBtn" class="ghost">Cancel</button>
             <button id="settingsApplyBtn" class="primary">Apply</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <!-- New-project wizard -->
+    <div class="modal-backdrop hidden" id="wizardModal">
+      <div class="modal modal-wizard">
+        <header class="modal-header">
+          <h2>New project group</h2>
+          <div class="wizard-stepper">
+            <span class="step" data-step="1">1 · basics</span>
+            <span class="step" data-step="2">2 · producer</span>
+            <span class="step" data-step="3">3 · scan</span>
+            <span class="step" data-step="4">4 · review</span>
+          </div>
+          <button id="wizardCloseBtn" class="ghost small">✕</button>
+        </header>
+        <div class="modal-body wizard-body">
+          <!-- Step 1 — basics -->
+          <section class="wizard-step" data-step="1">
+            <div class="form-grid">
+              <label><span>Display name</span>
+                <input type="text" id="wzName" placeholder="e.g. Myproject" />
+              </label>
+              <label><span>Group id (slug)</span>
+                <input type="text" id="wzSlug" placeholder="auto from name" />
+              </label>
+              <label><span>Emoji</span>
+                <input type="text" id="wzEmoji" maxlength="4" placeholder="🎮" />
+              </label>
+              <label class="full"><span>Workspace directory</span>
+                <div class="browse-row">
+                  <input type="text" id="wzWorkspace" placeholder="C:\path\to\project" />
+                  <button id="wzBrowseBtn" class="ghost small">Browse…</button>
+                </div>
+              </label>
+            </div>
+            <p class="muted">Group id is the agent prefix — e.g. <code>myproject.architect</code>. Editable now, locked after create.</p>
+          </section>
+
+          <!-- Step 2 — producer model -->
+          <section class="wizard-step hidden" data-step="2">
+            <p>Pick a Producer model. Producer reads the project then proposes the rest of the team.</p>
+            <div class="form-grid">
+              <label><span>Provider · Model</span>
+                <select id="wzProducerModel"></select>
+              </label>
+              <label><span>Thinking</span>
+                <select id="wzProducerThinking"></select>
+              </label>
+            </div>
+            <p class="muted">Scan reads CLAUDE.md, README.md, manifests, and top-level directory listings — capped at ~24KB total. Cost is small.</p>
+          </section>
+
+          <!-- Step 3 — scan / proposal -->
+          <section class="wizard-step hidden" data-step="3">
+            <div id="wzScanProgress" class="wizard-progress">
+              <div class="spinner large"></div>
+              <div id="wzScanPhase" class="phase">starting…</div>
+              <div id="wzScanDetail" class="muted"></div>
+            </div>
+            <div id="wzProposal" class="hidden">
+              <p id="wzRationale" class="rationale"></p>
+              <div id="wzSpecialistList" class="specialist-cards"></div>
+              <p class="muted">Producer's system prompt will be auto-generated from a template (you'll review on the next step).</p>
+            </div>
+          </section>
+
+          <!-- Step 4 — review prompts -->
+          <section class="wizard-step hidden" data-step="4">
+            <p>Review and edit each generated system prompt before committing.</p>
+            <div class="prompt-tabs" id="wzPromptTabs"></div>
+            <div class="prompt-editor">
+              <textarea id="wzPromptEditor" rows="22" spellcheck="false"></textarea>
+              <div class="prompt-meta muted" id="wzPromptMeta"></div>
+            </div>
+          </section>
+
+          <div id="wzCreateProgress" class="wizard-progress hidden">
+            <div class="spinner large"></div>
+            <div id="wzCreatePhase" class="phase">creating…</div>
+          </div>
+        </div>
+        <footer class="modal-footer">
+          <span id="wizardStatus" class="muted"></span>
+          <div class="modal-footer-actions">
+            <button id="wzCancelBtn" class="ghost">Cancel</button>
+            <button id="wzBackBtn" class="ghost hidden">← Back</button>
+            <button id="wzNextBtn" class="primary">Next →</button>
           </div>
         </footer>
       </div>

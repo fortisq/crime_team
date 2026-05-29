@@ -1,5 +1,10 @@
 {
   "perGroupThinking": {
+    "crime-team-orchestra": {
+      "backend": "low",
+      "desktop": "low",
+      "producer": "high"
+    },
     "crimeos": {
       "architect": "high",
       "art-director": "low",

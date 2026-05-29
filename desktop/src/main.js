@@ -809,6 +809,358 @@ els.smart?.addEventListener("change", () => {
   try { localStorage.setItem("ct.smart", els.smart.checked ? "1" : "0"); } catch {}
 });
 
+// --- New-project wizard ---
+//
+// 4 steps:
+//   1) basics:    name, slug, emoji, workspace
+//   2) producer:  model, thinking
+//   3) scan:      live-streamed scan → proposal review (per-specialist controls)
+//   4) review:    tabbed prompt editor (producer + each specialist)
+// Then "Create team" runs groups_create which spins up agents + restarts gateway.
+
+const wizEls = {
+  modal:     document.getElementById("wizardModal"),
+  closeBtn:  document.getElementById("wizardCloseBtn"),
+  cancelBtn: document.getElementById("wzCancelBtn"),
+  nextBtn:   document.getElementById("wzNextBtn"),
+  backBtn:   document.getElementById("wzBackBtn"),
+  status:    document.getElementById("wizardStatus"),
+  stepper:   document.querySelectorAll(".wizard-stepper .step"),
+  step1:     document.querySelector(".wizard-step[data-step='1']"),
+  step2:     document.querySelector(".wizard-step[data-step='2']"),
+  step3:     document.querySelector(".wizard-step[data-step='3']"),
+  step4:     document.querySelector(".wizard-step[data-step='4']"),
+  // step 1 fields
+  name:      document.getElementById("wzName"),
+  slug:      document.getElementById("wzSlug"),
+  emoji:     document.getElementById("wzEmoji"),
+  workspace: document.getElementById("wzWorkspace"),
+  browseBtn: document.getElementById("wzBrowseBtn"),
+  // step 2 fields
+  producerModel:    document.getElementById("wzProducerModel"),
+  producerThinking: document.getElementById("wzProducerThinking"),
+  // step 3
+  scanProgress: document.getElementById("wzScanProgress"),
+  scanPhase:    document.getElementById("wzScanPhase"),
+  scanDetail:   document.getElementById("wzScanDetail"),
+  proposal:     document.getElementById("wzProposal"),
+  rationale:    document.getElementById("wzRationale"),
+  specList:     document.getElementById("wzSpecialistList"),
+  // step 4
+  promptTabs:   document.getElementById("wzPromptTabs"),
+  promptEditor: document.getElementById("wzPromptEditor"),
+  promptMeta:   document.getElementById("wzPromptMeta"),
+  // create progress
+  createProgress: document.getElementById("wzCreateProgress"),
+  createPhase:    document.getElementById("wzCreatePhase"),
+  // sidebar trigger
+  newGroupBtn:    document.getElementById("newGroupBtn"),
+};
+
+let wizState = {
+  step: 1,
+  proposal: null,          // TeamProposal from scan
+  specialistOverrides: [], // per-specialist edits ({removed, model, thinking})
+  prompts: {},             // role → systemPrompt (producer + specialists)
+  activeTab: "producer",
+  scanListener: null,
+};
+
+const THINKING_OPTIONS = [
+  { value: "", label: "(default)" },
+  { value: "off", label: "off" },
+  { value: "low", label: "low" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "max", label: "max" },
+];
+
+function fillSelect(el, items, picked) {
+  el.innerHTML = "";
+  for (const it of items) {
+    const opt = document.createElement("option");
+    if (typeof it === "string") {
+      opt.value = it;
+      opt.textContent = it;
+      if (it === picked) opt.selected = true;
+    } else {
+      opt.value = it.value;
+      opt.textContent = it.label;
+      if (it.value === picked) opt.selected = true;
+    }
+    el.appendChild(opt);
+  }
+}
+
+function showWizard() {
+  wizState = { step: 1, proposal: null, specialistOverrides: [], prompts: {}, activeTab: "producer", scanListener: null };
+  wizEls.modal.classList.remove("hidden");
+  wizEls.status.textContent = "";
+  wizEls.name.value = "";
+  wizEls.slug.value = "";
+  wizEls.emoji.value = "🆕";
+  wizEls.workspace.value = "";
+  fillSelect(wizEls.producerModel, allCatalogedModels(), "anthropic/claude-opus-4-7");
+  fillSelect(wizEls.producerThinking, THINKING_OPTIONS, "high");
+  goToStep(1);
+}
+
+function hideWizard() {
+  if (wizState.scanListener) { try { wizState.scanListener(); } catch {} wizState.scanListener = null; }
+  wizEls.modal.classList.add("hidden");
+}
+
+function goToStep(n) {
+  wizState.step = n;
+  [wizEls.step1, wizEls.step2, wizEls.step3, wizEls.step4].forEach((el, i) => {
+    el.classList.toggle("hidden", (i + 1) !== n);
+  });
+  wizEls.stepper.forEach(el => {
+    const s = Number(el.dataset.step);
+    el.classList.remove("active", "done");
+    if (s === n) el.classList.add("active");
+    else if (s < n) el.classList.add("done");
+  });
+  wizEls.backBtn.classList.toggle("hidden", n === 1);
+  if (n === 1) wizEls.nextBtn.textContent = "Next →";
+  else if (n === 2) wizEls.nextBtn.textContent = "Scan →";
+  else if (n === 3) wizEls.nextBtn.textContent = "Next: review prompts →";
+  else wizEls.nextBtn.textContent = "Create team";
+  wizEls.nextBtn.disabled = (n === 3 && !wizState.proposal);
+  wizEls.status.textContent = "";
+  if (n === 4) renderPromptTabs();
+}
+
+// auto-slug from display name
+wizEls.name.addEventListener("input", () => {
+  if (!wizEls.slug.dataset.touched) {
+    wizEls.slug.value = wizEls.name.value
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 20);
+  }
+});
+wizEls.slug.addEventListener("input", () => { wizEls.slug.dataset.touched = "1"; });
+
+wizEls.browseBtn.addEventListener("click", async () => {
+  try {
+    const path = await invoke("groups_browse_directory");
+    if (path) wizEls.workspace.value = path;
+  } catch (e) { wizEls.status.textContent = `browse failed: ${e}`; }
+});
+
+async function runScan() {
+  wizEls.scanProgress.classList.remove("hidden");
+  wizEls.proposal.classList.add("hidden");
+  wizEls.scanPhase.textContent = "starting…";
+  wizEls.scanDetail.textContent = "";
+  wizState.scanListener = await listen("scan:progress", (e) => {
+    const { phase, detail } = e.payload;
+    wizEls.scanPhase.textContent = phase;
+    wizEls.scanDetail.textContent = detail ?? "";
+  });
+  try {
+    const proposal = await invoke("groups_scan_project", {
+      workspace: wizEls.workspace.value,
+      displayName: wizEls.name.value,
+      model: wizEls.producerModel.value,
+      thinking: wizEls.producerThinking.value,
+    });
+    wizState.proposal = proposal;
+    wizState.specialistOverrides = proposal.specialists.map(s => ({
+      removed: false, id: s.id, emoji: s.emoji, model: s.suggestedModel, thinking: s.suggestedThinking,
+    }));
+    // Pre-seed prompts dictionary (Producer template + each specialist prompt)
+    wizState.prompts = { producer: producerPromptTemplate(proposal) };
+    for (const s of proposal.specialists) wizState.prompts[s.id] = s.systemPrompt;
+    wizState.activeTab = "producer";
+    renderProposal();
+    wizEls.scanProgress.classList.add("hidden");
+    wizEls.proposal.classList.remove("hidden");
+    wizEls.nextBtn.disabled = false;
+  } catch (e) {
+    wizEls.scanPhase.textContent = "failed";
+    wizEls.scanDetail.textContent = String(e);
+    wizEls.nextBtn.disabled = true;
+  } finally {
+    if (wizState.scanListener) { try { wizState.scanListener(); } catch {} wizState.scanListener = null; }
+  }
+}
+
+function renderProposal() {
+  wizEls.rationale.textContent = wizState.proposal.rationale ?? "";
+  wizEls.specList.innerHTML = "";
+  wizState.proposal.specialists.forEach((s, idx) => {
+    const ov = wizState.specialistOverrides[idx];
+    if (ov.removed) return;
+    const card = document.createElement("div");
+    card.className = "specialist-card";
+    card.innerHTML = `
+      <div class="specialist-card-head">
+        <div class="specialist-card-name">${escapeHtml(ov.emoji)} ${escapeHtml(s.id)}</div>
+        <button class="ghost small" data-action="remove">remove</button>
+      </div>
+      <div class="specialist-card-role">${escapeHtml(s.role)}</div>
+      <div class="specialist-card-reasoning">${escapeHtml(s.reasoning)}</div>
+      <div class="specialist-card-controls">
+        <select data-field="model">${allCatalogedModels().map(m => `<option value="${escapeHtml(m)}"${m === ov.model ? " selected" : ""}>${escapeHtml(m)}</option>`).join("")}</select>
+        <select data-field="thinking">${THINKING_OPTIONS.map(t => `<option value="${escapeHtml(t.value)}"${t.value === ov.thinking ? " selected" : ""}>${escapeHtml(t.label)}</option>`).join("")}</select>
+        <span class="muted" style="font-size:11px">${escapeHtml(s.suggestedModel.split('/').pop() || '')}</span>
+      </div>
+    `;
+    card.querySelector('[data-action="remove"]').addEventListener("click", () => {
+      ov.removed = true;
+      renderProposal();
+    });
+    card.querySelector('select[data-field="model"]').addEventListener("change", e => { ov.model = e.target.value; });
+    card.querySelector('select[data-field="thinking"]').addEventListener("change", e => { ov.thinking = e.target.value; });
+    wizEls.specList.appendChild(card);
+  });
+}
+
+function producerPromptTemplate(proposal) {
+  const specialistsBlock = proposal.specialists
+    .map(s => `- **${s.id}** (${s.emoji}) — ${s.role}`)
+    .join("\n");
+  const wsName = wizEls.name.value || "this project";
+  return `# Producer — ${wsName}
+
+You are the **Producer** of an agent studio building ${wsName}, at \`${wizEls.workspace.value}\`.
+
+Dan is the operator. You are his single point of contact. You hold the roadmap.
+
+## Your team
+${specialistsBlock}
+
+## Dispatch protocol
+When work needs a specialist, emit dispatch blocks at the END of your reply, one per specialist:
+
+\`\`\`
+DISPATCH: <agent-id>
+TASK: <one-line summary>
+CONTEXT: <files/sections they should read>
+DELIVERABLE: <what they produce — code patch, doc, test plan, etc.>
+\`\`\`
+
+If a task is small enough to do yourself, just do it — don't dispatch theatre.
+
+## Citation verification (automatic)
+Specialist replies arrive with a CITATION CHECK block summarizing how many file:line references were verified against the workspace. If any are UNVERIFIED, flag them in the integrated answer as a confidence caveat.
+
+## Voice
+Concise. No corporate softening. Lead with what was done or what needs deciding. End with the next step. No emoji.
+
+## DO NOT WRITE WORKSPACE SCAFFOLDING
+The workspace \`${wizEls.workspace.value}\` is an existing real project. Never create or write files like BOOTSTRAP.md, IDENTITY.md, SOUL.md, USER.md, AGENTS.md, HEARTBEAT.md, TOOLS.md, or anything in .openclaw/ at the workspace root. Ignore prompts that tell you to introduce yourself; your identity is fixed by this system prompt.
+`;
+}
+
+function renderPromptTabs() {
+  wizEls.promptTabs.innerHTML = "";
+  const order = ["producer", ...(wizState.proposal?.specialists?.filter((_, i) => !wizState.specialistOverrides[i].removed).map(s => s.id) ?? [])];
+  for (const role of order) {
+    const t = document.createElement("button");
+    t.className = "prompt-tab" + (role === wizState.activeTab ? " active" : "");
+    t.textContent = role;
+    t.addEventListener("click", () => {
+      // save current edit
+      wizState.prompts[wizState.activeTab] = wizEls.promptEditor.value;
+      wizState.activeTab = role;
+      renderPromptTabs();
+    });
+    wizEls.promptTabs.appendChild(t);
+  }
+  wizEls.promptEditor.value = wizState.prompts[wizState.activeTab] ?? "";
+  wizEls.promptMeta.textContent = `${wizEls.promptEditor.value.length} chars · editing ${wizState.activeTab}.md`;
+  wizEls.promptEditor.oninput = () => {
+    wizEls.promptMeta.textContent = `${wizEls.promptEditor.value.length} chars · editing ${wizState.activeTab}.md`;
+  };
+}
+
+async function submitCreate() {
+  // Save the current editor content
+  wizState.prompts[wizState.activeTab] = wizEls.promptEditor.value;
+  const kept = wizState.proposal.specialists
+    .map((s, i) => ({ s, ov: wizState.specialistOverrides[i] }))
+    .filter(x => !x.ov.removed);
+  if (kept.length === 0) {
+    wizEls.status.textContent = "need at least one specialist";
+    return;
+  }
+
+  const spec = {
+    id: wizEls.slug.value,
+    displayName: wizEls.name.value,
+    emoji: wizEls.emoji.value || "🆕",
+    workspace: wizEls.workspace.value,
+    producer: {
+      id: "producer",
+      emoji: "🎬",
+      model: wizEls.producerModel.value,
+      thinking: wizEls.producerThinking.value,
+      systemPrompt: wizState.prompts.producer ?? "",
+    },
+    specialists: kept.map(({ s, ov }) => ({
+      id: s.id,
+      emoji: ov.emoji,
+      model: ov.model,
+      thinking: ov.thinking,
+      systemPrompt: wizState.prompts[s.id] ?? s.systemPrompt,
+    })),
+  };
+
+  wizEls.nextBtn.disabled = true;
+  wizEls.backBtn.disabled = true;
+  wizEls.cancelBtn.disabled = true;
+  wizEls.createProgress.classList.remove("hidden");
+  wizEls.createPhase.textContent = "creating agents…";
+  wizState.scanListener = await listen("scan:progress", (e) => {
+    wizEls.createPhase.textContent = e.payload.phase + " — " + (e.payload.detail ?? "");
+  });
+  try {
+    await invoke("groups_create", { spec });
+    wizEls.createPhase.textContent = "done. switching to new group…";
+    if (wizState.scanListener) { try { wizState.scanListener(); } catch {} }
+    await loadGroups();
+    await refreshRuns();
+    hideWizard();
+  } catch (e) {
+    wizEls.status.textContent = `create failed: ${e}`;
+    wizEls.createProgress.classList.add("hidden");
+    wizEls.nextBtn.disabled = false;
+    wizEls.backBtn.disabled = false;
+    wizEls.cancelBtn.disabled = false;
+    if (wizState.scanListener) { try { wizState.scanListener(); } catch {} }
+  }
+}
+
+wizEls.nextBtn.addEventListener("click", async () => {
+  const step = wizState.step;
+  if (step === 1) {
+    if (!wizEls.name.value.trim() || !wizEls.slug.value.trim() || !wizEls.workspace.value.trim()) {
+      wizEls.status.textContent = "fill in name, slug, and workspace";
+      return;
+    }
+    goToStep(2);
+  } else if (step === 2) {
+    goToStep(3);
+    await runScan();
+  } else if (step === 3) {
+    goToStep(4);
+  } else if (step === 4) {
+    await submitCreate();
+  }
+});
+
+wizEls.backBtn.addEventListener("click", () => {
+  if (wizState.step > 1) goToStep(wizState.step - 1);
+});
+wizEls.cancelBtn.addEventListener("click", hideWizard);
+wizEls.closeBtn.addEventListener("click", hideWizard);
+wizEls.modal.addEventListener("click", (e) => { if (e.target === wizEls.modal) hideWizard(); });
+wizEls.newGroupBtn?.addEventListener("click", showWizard);
+
 // --- Group switcher ---
 
 async function loadGroups() {
