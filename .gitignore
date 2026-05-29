@@ -18,6 +18,18 @@ runs/
 .env.*
 !.env.example
 
+# OpenClaw workspace bootstrap pollution — never commit these
+# (OpenClaw drops these in any CWD it sees as an "agent workspace")
+.openclaw/
+BOOTSTRAP.md
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+workspace-state.json
+
 # Editor / OS
 .vscode/local/
 .idea/
