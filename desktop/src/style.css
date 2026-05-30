@@ -295,6 +295,33 @@ button.gear { /* fallback: if there's no inner span, just don't rotate */ }
 }
 #answerModal .modal { position: relative; }
 
+/* In-app confirm dialog — Tauri 2 disables window.confirm() so we render our
+   own. Smaller than the big modals; auto-height; readable body text. */
+.confirm-modal { width: min(560px, 92vw); }
+.confirm-modal .confirm-body-wrap { padding: 18px 20px; }
+.confirm-modal .confirm-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.confirm-modal .prompt-input {
+  width: 100%;
+  margin-top: 12px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+/* Action cell with multiple buttons (Rename + Remove) */
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.row-actions button { white-space: nowrap; }
+
 /* Wizard modal */
 .modal-wizard {
   width: 90vw;

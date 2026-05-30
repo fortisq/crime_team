@@ -1,6 +1,66 @@
 // Frontend entry. Talks to Tauri via window.__TAURI__.{core,event}.
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+
+/**
+ * In-app confirm modal. Tauri 2 disables window.confirm() (it'd block the
+ * renderer), so every prior `confirm()` call was a silent no-op — Remove
+ * buttons fired immediately. This helper renders a small modal that matches
+ * the app's style and supports a red "destructive" variant.
+ *
+ * Returns a Promise<boolean>. Cancel (Esc / backdrop click / Cancel button)
+ * resolves false; confirm button resolves true. Focus defaults to Cancel for
+ * destructive dialogs so a stray Enter can't blow things up.
+ *
+ * Usage:
+ *   if (!await confirmDialog({
+ *     title: "Remove specialist?",
+ *     body: "This will…",
+ *     confirmLabel: "Remove",
+ *     destructive: true,
+ *   })) return;
+ */
+function confirmDialog({ title, body, confirmLabel = "OK", cancelLabel = "Cancel", destructive = false }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal confirm-modal" role="dialog" aria-modal="true">
+        <header class="modal-header">
+          <h2>${escapeHtml(title)}</h2>
+        </header>
+        <div class="modal-body confirm-body-wrap">
+          <p class="confirm-body">${escapeHtml(body).replace(/\n/g, "<br>")}</p>
+        </div>
+        <footer class="modal-footer">
+          <div class="modal-footer-actions">
+            <button type="button" class="confirm-cancel">${escapeHtml(cancelLabel)}</button>
+            <button type="button" class="${destructive ? "danger" : "primary"} confirm-ok">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </footer>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cancelBtn = backdrop.querySelector(".confirm-cancel");
+    const okBtn = backdrop.querySelector(".confirm-ok");
+    const close = (result) => {
+      document.removeEventListener("keydown", keyHandler);
+      backdrop.remove();
+      resolve(result);
+    };
+    const keyHandler = (e) => {
+      if (e.key === "Escape") close(false);
+      else if (e.key === "Enter" && !destructive) close(true);
+    };
+    okBtn.addEventListener("click", () => close(true));
+    cancelBtn.addEventListener("click", () => close(false));
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(false); });
+    document.addEventListener("keydown", keyHandler);
+    // Default focus on Cancel for destructive dialogs so an accidental Enter
+    // can't fire Remove. Non-destructive dialogs focus the confirm button.
+    (destructive ? cancelBtn : okBtn).focus();
+  });
+}
 import { PRESETS as BUNDLED_PRESETS, ANGLES as BUNDLED_ANGLES } from "./presets.js";
 
 // Mutable per-group preset state. Replaced by loadPresetsForActiveGroup()
@@ -14,6 +74,7 @@ const els = {
   smart:       document.getElementById("smartDispatchInput"),
   timeout:     document.getElementById("timeoutInput"),
   runBtn:      document.getElementById("runBtn"),
+  generateBtn: document.getElementById("generateTaskBtn"),
   cancelBtn:   document.getElementById("cancelBtn"),
   newRunBtn:   document.getElementById("newRunBtn"),
   statusSec:   document.getElementById("statusSection"),
@@ -82,7 +143,7 @@ function populatePresets() {
   }
 }
 
-function applyPreset() {
+async function applyPreset() {
   const sel = els.presetSelect.selectedOptions[0];
   if (!sel || !sel.dataset.prompt) return;
   const angleOpt = els.angleSelect.selectedOptions[0];
@@ -90,8 +151,12 @@ function applyPreset() {
   // If textarea has unsaved user edits (non-empty + not from a previous preset),
   // confirm before overwriting. Otherwise just set it.
   const current = els.taskInput.value.trim();
-  const overwrite = !current || els.taskInput.dataset.fromPreset === "1"
-    || confirm("Replace the current task with the preset?");
+  const needsConfirm = current && els.taskInput.dataset.fromPreset !== "1";
+  const overwrite = !needsConfirm || await confirmDialog({
+    title: "Replace task text?",
+    body: "Your task input has unsaved text. Loading this preset will replace it.",
+    confirmLabel: "Replace",
+  });
   if (!overwrite) {
     // revert the select to "— Pick a preset —"
     els.presetSelect.selectedIndex = 0;
@@ -456,6 +521,53 @@ async function loadRun(runId, itemEl) {
 
 els.runBtn.addEventListener("click", startRun);
 els.cancelBtn.addEventListener("click", cancelRun);
+els.generateBtn?.addEventListener("click", generateMainTaskPrompt);
+
+/**
+ * Generate a polished task prompt from a fuzzy user brief using the active
+ * group's Producer. Mirrors the Add-specialist Generate flow but aimed at
+ * the main task input box. Producer takes 30-90s via claude-cli; Run is
+ * disabled the whole time so the user can't kick off the actual run before
+ * Generate returns. The brief in the textarea is replaced with the polished
+ * prompt on success.
+ */
+async function generateMainTaskPrompt() {
+  const brief = els.taskInput.value.trim();
+  if (!brief) {
+    alert("Type a brief in the task box first — e.g. \"audit auth flows for missing validation\" — then click Generate.");
+    return;
+  }
+  if (!activeGroup) {
+    alert("No active group loaded yet.");
+    return;
+  }
+  const ok = els.taskInput.dataset.fromPreset !== "1"
+    && brief.length > 200
+    ? await confirmDialog({
+        title: "Replace existing task?",
+        body: `Generate will send your current text to the ${activeGroup.id} Producer and replace it with a polished version. Your current text (${brief.length} chars) will be lost.`,
+        confirmLabel: "Generate",
+      })
+    : true;
+  if (!ok) return;
+
+  const originalLabel = els.generateBtn.textContent;
+  els.generateBtn.disabled = true;
+  els.generateBtn.textContent = `asking ${activeGroup.id} Producer…`;
+  els.runBtn.disabled = true;
+  try {
+    const polished = await invoke("chat_generate_task_prompt", { brief });
+    els.taskInput.value = polished;
+    els.taskInput.dataset.fromPreset = "0"; // it's now user-edited territory
+    els.taskInput.focus();
+  } catch (e) {
+    alert(`Generate failed: ${String(e).slice(0, 400)}`);
+  } finally {
+    els.generateBtn.disabled = false;
+    els.generateBtn.textContent = originalLabel;
+    els.runBtn.disabled = false;
+  }
+}
 els.newRunBtn.addEventListener("click", () => {
   els.taskInput.value = "";
   els.taskInput.focus();
@@ -682,7 +794,19 @@ async function renderGroupsTable() {
     });
     tr.querySelector('[data-action="edit"]')?.addEventListener("click", () => openEditGroup(g));
     tr.querySelector('[data-action="remove"]')?.addEventListener("click", async () => {
-      if (!confirm(`Remove group "${g.displayName}"?\n\nThis deletes:\n  • ${agentCount} agents\n  • their system prompts\n  • runs/${g.id}/ history\n  • the group's preset library\n\nThis cannot be undone.`)) return;
+      if (!await confirmDialog({
+        title: `Remove group "${g.displayName}"?`,
+        body:
+          `Removing this group will delete:\n` +
+          `  • ${agentCount} agents (OpenClaw config + ~/.openclaw/agents/<id>/ dirs)\n` +
+          `  • Their system prompts in ~/.openclaw/team-prompts/\n` +
+          `  • Run history at runs/${g.id}/\n` +
+          `  • The group's preset library at ~/.crime-team/groups/${g.id}/\n\n` +
+          `The workspace at ${g.workspace} will NOT be touched.\n\n` +
+          `This cannot be undone.`,
+        confirmLabel: "Remove group",
+        destructive: true,
+      })) return;
       try {
         await invoke("groups_remove", { groupId: g.id });
         await loadGroups();
@@ -746,6 +870,49 @@ async function openEditGroup(group) {
     egEls.agentsTbody.innerHTML = `<tr><td colspan="4" class="muted">load failed: ${escapeHtml(String(e))}</td></tr>`;
   }
 
+  // Populate the "Add specialist" form's model + thinking dropdowns each time
+  // we open the modal (model catalog can grow between openings).
+  const newSpecModel = document.getElementById("egNewSpecModel");
+  if (newSpecModel) {
+    fillSelect(newSpecModel, allCatalogedModels(), "anthropic/claude-sonnet-4-6");
+    const newSpecThinking = document.getElementById("egNewSpecThinking");
+    if (newSpecThinking) {
+      newSpecThinking.innerHTML = renderThinkingOptions(thinkingLevelsFor(newSpecModel.value), "medium");
+      newSpecModel.onchange = () => {
+        newSpecThinking.innerHTML = renderThinkingOptions(thinkingLevelsFor(newSpecModel.value), "medium");
+      };
+    }
+  }
+  const addBtn = document.getElementById("egAddSpecBtn");
+  if (addBtn && !addBtn.dataset.wired) {
+    // Bind once. preventDefault stops the <details> form's default submit.
+    addBtn.addEventListener("click", (e) => { e.preventDefault(); addSpecialist(); });
+    addBtn.dataset.wired = "1";
+  }
+  const genBtn = document.getElementById("egGenerateSpecBtn");
+  if (genBtn && !genBtn.dataset.wired) {
+    genBtn.addEventListener("click", (e) => { e.preventDefault(); generateSpecialistPrompt(); });
+    genBtn.dataset.wired = "1";
+  }
+  // Auto-normalize the role-id input as the user types: lowercase, collapse
+  // spaces and underscores into hyphens, strip anything else. Without this,
+  // typing "Security Test" produces "Security Test" which fails the
+  // kebab-case validator on submit — confusing UX. Now you can type naturally
+  // and the field shows the sanitized id live.
+  const newSpecIdInput = document.getElementById("egNewSpecId");
+  if (newSpecIdInput && !newSpecIdInput.dataset.wired) {
+    newSpecIdInput.addEventListener("input", (e) => {
+      const cleaned = e.target.value
+        .toLowerCase()
+        .replace(/[\s_]+/g, "-")          // spaces/underscores → hyphens
+        .replace(/[^a-z0-9-]/g, "")        // strip everything else
+        .replace(/-+/g, "-")               // collapse multiple hyphens
+        .slice(0, 20);                     // hard cap
+      if (cleaned !== e.target.value) e.target.value = cleaned;
+    });
+    newSpecIdInput.dataset.wired = "1";
+  }
+
   egEls.status.textContent = "";
   renderEgTabs();
   egEls.modal.classList.remove("hidden");
@@ -754,8 +921,16 @@ async function openEditGroup(group) {
 function renderEgAgentsTable(agents) {
   egEls.agentsTbody.innerHTML = "";
   const all = allCatalogedModels();
+  // Producer can never be removed (a group always has exactly one). The last
+  // specialist also can't be removed — Rust enforces that, but we disable the
+  // button here for clearer UX.
+  const producerId = egState.group.producerAgentId;
+  const specialistCount = egState.group.specialists.length;
+
   for (const a of agents) {
     const role = a.id.startsWith(egState.group.id + ".") ? a.id.slice(egState.group.id.length + 1) : a.id;
+    const isProducer = a.id === producerId;
+    const isLastSpecialist = !isProducer && specialistCount <= 1;
     const options = new Set(all);
     if (a.primary) options.add(a.primary);
     const sortedOpts = Array.from(options).sort();
@@ -775,6 +950,13 @@ function renderEgAgentsTable(agents) {
         <select data-agent="${escapeHtml(a.id)}" data-field="thinking">
           ${renderThinkingOptions(thinkingLevels, currentThinking)}
         </select>
+      </td>
+      <td class="row-actions">
+        ${isProducer
+          ? `<span class="muted" title="The Producer is required and can't be renamed or removed.">—</span>`
+          : `<button class="small" data-rename-role="${escapeHtml(role)}">Rename</button>
+             <button class="danger small" data-remove-role="${escapeHtml(role)}"${isLastSpecialist ? ' disabled title="A group needs at least one specialist."' : ""}>Remove</button>`
+        }
       </td>
     `;
     const modelSel = tr.querySelector('select[data-field="primary"]');
@@ -800,7 +982,227 @@ function renderEgAgentsTable(agents) {
       else delete egState.pendingAgentChanges[a.id].thinking;
     });
 
+    const removeBtn = tr.querySelector("button[data-remove-role]");
+    if (removeBtn && !removeBtn.disabled) {
+      removeBtn.addEventListener("click", () => removeSpecialist(role));
+    }
+    const renameBtn = tr.querySelector("button[data-rename-role]");
+    if (renameBtn) {
+      renameBtn.addEventListener("click", () => renameSpecialist(role));
+    }
+
     egEls.agentsTbody.appendChild(tr);
+  }
+}
+
+/**
+ * Sibling of confirmDialog with an input field. Returns the trimmed string
+ * the user typed, or null if cancelled. Auto-normalizes kebab-case as the
+ * user types (lowercase + spaces→hyphens + strip invalid chars + ≤20 chars),
+ * matching the Add-specialist field's behavior. The Enter key submits the
+ * dialog (allowed here because there's nothing destructive to fat-finger).
+ */
+function promptDialog({ title, body, defaultValue = "", placeholder = "", confirmLabel = "OK" }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal confirm-modal" role="dialog" aria-modal="true">
+        <header class="modal-header"><h2>${escapeHtml(title)}</h2></header>
+        <div class="modal-body confirm-body-wrap">
+          ${body ? `<p class="confirm-body">${escapeHtml(body).replace(/\n/g, "<br>")}</p>` : ""}
+          <input type="text" class="prompt-input" value="${escapeHtml(defaultValue)}" placeholder="${escapeHtml(placeholder)}" maxlength="20" />
+        </div>
+        <footer class="modal-footer">
+          <div class="modal-footer-actions">
+            <button type="button" class="confirm-cancel">Cancel</button>
+            <button type="button" class="primary confirm-ok">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </footer>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const input = backdrop.querySelector(".prompt-input");
+    const cancelBtn = backdrop.querySelector(".confirm-cancel");
+    const okBtn = backdrop.querySelector(".confirm-ok");
+    // Auto-normalize as user types — same rules as the Add-specialist input
+    input.addEventListener("input", (e) => {
+      const cleaned = e.target.value.toLowerCase()
+        .replace(/[\s_]+/g, "-")
+        .replace(/[^a-z0-9-]/g, "")
+        .replace(/-+/g, "-")
+        .slice(0, 20);
+      if (cleaned !== e.target.value) e.target.value = cleaned;
+    });
+    const close = (result) => {
+      document.removeEventListener("keydown", keyHandler);
+      backdrop.remove();
+      resolve(result);
+    };
+    const keyHandler = (e) => {
+      if (e.key === "Escape") close(null);
+      else if (e.key === "Enter") {
+        const v = input.value.trim();
+        if (v) close(v);
+      }
+    };
+    okBtn.addEventListener("click", () => {
+      const v = input.value.trim();
+      if (v) close(v);
+    });
+    cancelBtn.addEventListener("click", () => close(null));
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(null); });
+    document.addEventListener("keydown", keyHandler);
+    input.focus();
+    input.select();
+  });
+}
+
+/**
+ * Rename a specialist's role id. Calls groups_rename_specialist which moves
+ * the agent dir, prompt file, openclaw.json + groups.json + .crime-team.json
+ * entries — gateway restart included. Workspace is never touched.
+ */
+async function renameSpecialist(oldRole) {
+  const newRole = await promptDialog({
+    title: `Rename specialist "${oldRole}"`,
+    body: `Enter the new role id. Kebab-case, ≤20 chars (auto-normalized as you type).`,
+    defaultValue: oldRole,
+    placeholder: "e.g. sec-audit",
+    confirmLabel: "Rename",
+  });
+  if (!newRole || newRole === oldRole) return;
+
+  egEls.status.textContent = `renaming ${oldRole} → ${newRole}…`;
+  try {
+    const updated = await invoke("groups_rename_specialist", {
+      groupId: egState.group.id,
+      oldRole,
+      newRole,
+    });
+    egState.group = updated;
+    await loadGroups();
+    await openEditGroup(updated);
+    egEls.status.textContent = `renamed ${oldRole} → ${newRole}`;
+  } catch (e) {
+    egEls.status.textContent = `rename failed: ${String(e).slice(0, 200)}`;
+  }
+}
+
+/**
+ * Remove a specialist from the currently-edited group. Surfaces a confirm
+ * dialog that explicitly states the workspace will NOT be touched — that's the
+ * lesson from the ServUO incident, see lib.rs::groups_remove for the full
+ * write-up. The Rust command refuses to call `openclaw agents delete`.
+ */
+async function removeSpecialist(role) {
+  const ws = egState.group.workspace;
+  const ok = await confirmDialog({
+    title: `Remove specialist "${role}"?`,
+    body:
+      `Removing this specialist from "${egState.group.displayName}" will:\n` +
+      `  • Drop the agent from OpenClaw config\n` +
+      `  • Delete the agent's chat history at ~/.openclaw/agents/${egState.group.id}.${role}/\n` +
+      `  • Delete the team-prompt file\n\n` +
+      `The workspace at ${ws} will NOT be touched.`,
+    confirmLabel: "Remove specialist",
+    destructive: true,
+  });
+  if (!ok) return;
+
+  egEls.status.textContent = `removing ${role}…`;
+  try {
+    const updated = await invoke("groups_remove_specialist", { groupId: egState.group.id, role });
+    egState.group = updated;
+    // Reload Edit Group state so dropped role disappears from tabs + tables
+    await loadGroups();
+    await openEditGroup(updated);
+    egEls.status.textContent = `removed ${role}`;
+  } catch (e) {
+    egEls.status.textContent = `remove failed: ${e}`;
+  }
+}
+
+/**
+ * Ask this group's Producer to draft a system prompt for the new specialist
+ * from whatever the user typed into the prompt field (which doubles as the
+ * brief). Replaces the prompt textarea with Producer's reply on success so
+ * the user can review/edit before clicking Add specialist.
+ *
+ * Producer turns take 30-90s (claude-cli through the Max sub is the typical
+ * path); the buttons are disabled the whole time so accidental double-fires
+ * can't queue a second call.
+ */
+async function generateSpecialistPrompt() {
+  const id = document.getElementById("egNewSpecId").value.trim();
+  const brief = document.getElementById("egNewSpecPrompt").value.trim();
+  const statusEl = document.getElementById("egAddSpecStatus");
+  const genBtn = document.getElementById("egGenerateSpecBtn");
+  const addBtn = document.getElementById("egAddSpecBtn");
+
+  if (!id) { statusEl.textContent = "type a role id first"; return; }
+  if (!brief) { statusEl.textContent = "type a brief description of what this specialist should do"; return; }
+
+  statusEl.textContent = `asking ${egState.group.id} Producer to draft a prompt (typical 30-90s)…`;
+  genBtn.disabled = true;
+  addBtn.disabled = true;
+  try {
+    const generated = await invoke("groups_generate_specialist_prompt", {
+      groupId: egState.group.id,
+      role: id,
+      brief,
+    });
+    document.getElementById("egNewSpecPrompt").value = generated;
+    statusEl.textContent = `Producer drafted ${generated.length} chars — review + edit + click Add specialist`;
+  } catch (e) {
+    statusEl.textContent = `generate failed: ${String(e).slice(0, 200)}`;
+  } finally {
+    genBtn.disabled = false;
+    addBtn.disabled = false;
+  }
+}
+
+/**
+ * Submit the "Add a specialist" form. Calls groups_add_specialist, which
+ * mirrors the per-specialist portion of groups_create. On success, reloads
+ * Edit Group so the new specialist appears in the agents table + prompt tabs.
+ */
+async function addSpecialist() {
+  const id = document.getElementById("egNewSpecId").value.trim();
+  const emoji = document.getElementById("egNewSpecEmoji").value.trim() || "🤖";
+  const model = document.getElementById("egNewSpecModel").value;
+  const thinking = document.getElementById("egNewSpecThinking").value || "off";
+  const systemPrompt = document.getElementById("egNewSpecPrompt").value;
+  const statusEl = document.getElementById("egAddSpecStatus");
+
+  if (!id) { statusEl.textContent = "role id is required"; return; }
+  if (!/^[a-z0-9-]+$/.test(id) || id.length > 20) {
+    statusEl.textContent = "role id must be kebab-case (a-z, 0-9, -), ≤20 chars";
+    return;
+  }
+  if (id === "producer") { statusEl.textContent = "'producer' is reserved"; return; }
+  if (systemPrompt.trim().length < 50) {
+    statusEl.textContent = `system prompt too short (${systemPrompt.trim().length} chars; need ≥50)`;
+    return;
+  }
+
+  statusEl.textContent = "adding (gateway restart included)…";
+  try {
+    const updated = await invoke("groups_add_specialist", {
+      groupId: egState.group.id,
+      spec: { id, emoji, model, thinking, systemPrompt },
+    });
+    egState.group = updated;
+    // Clear the form
+    document.getElementById("egNewSpecId").value = "";
+    document.getElementById("egNewSpecPrompt").value = "";
+    document.getElementById("egAddSpecialistForm").open = false;
+    statusEl.textContent = "";
+    egEls.status.textContent = `added specialist '${id}'`;
+    await loadGroups();
+    await openEditGroup(updated);
+  } catch (e) {
+    statusEl.textContent = `add failed: ${e}`;
   }
 }
 function hideEditGroup() { egEls.modal.classList.add("hidden"); }
@@ -936,7 +1338,15 @@ function editProvider(provider, profileId) {
 }
 
 async function removeProvider(profileId, statusEl) {
-  if (!confirm(`Remove provider profile "${profileId}" from all agents? You can re-add the key later.`)) return;
+  if (!await confirmDialog({
+    title: `Remove provider profile "${profileId}"?`,
+    body:
+      `This removes the saved API key from ~/.openclaw/agents/main/agent/auth-profiles.json ` +
+      `and unwires it from every agent in every group.\n\n` +
+      `You can re-add the key any time from the Add form below.`,
+    confirmLabel: "Remove key",
+    destructive: true,
+  })) return;
   statusEl.textContent = "removing…";
   statusEl.className = "row-status muted";
   try {
@@ -1448,6 +1858,16 @@ async function submitCreate() {
   });
   try {
     await invoke("groups_create", { spec });
+    // Seed the new group's preset file with a copy of the bundled set so it
+    // starts with the full ~15 universal audit presets — same as Crime OS.
+    // The user can edit per-group from Settings → Edit Group → Presets later
+    // (or by hand at ~/.crime-team/groups/<id>/presets.json). Non-fatal if
+    // the seed fails: the group still loads with the bundled fallback.
+    try {
+      await invoke("groups_set_presets", { groupId: spec.id, presets: BUNDLED_PRESETS });
+    } catch (seedErr) {
+      console.warn(`failed to seed presets for new group '${spec.id}':`, seedErr);
+    }
     wizEls.createPhase.textContent = "done. switching to new group…";
     if (wizState.scanListener) { try { wizState.scanListener(); } catch {} }
     await loadGroups();

@@ -993,20 +993,63 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
     }
     let group = file.groups[idx].clone();
 
-    // 1. delete every agent from OpenClaw
+    // 1. CRITICAL SAFETY: do NOT call `openclaw agents delete` here.
+    //
+    // Each agent's `workspace` field points at the user's PROJECT DIRECTORY
+    // (we set it that way in groups_create line 712 so the sandbox can read
+    // the project). `openclaw agents delete` advertises "prune workspace and
+    // state" — and means it: it moves the entire workspace dir (the user's
+    // real project!) to ~/.Trash. Calling it once on a ServUO agent here
+    // wiped 940 MB / 11k files. Restored, then this path was rewritten to
+    // never touch the workspace.
+    //
+    // Instead: edit the openclaw config directly to drop the agent entries,
+    // and remove only the agent's own home dir under ~/.openclaw/agents/<id>/
+    // (which holds auth profiles + session jsonl files — never user data).
     let mut agent_ids: Vec<String> = group.specialists.clone();
     agent_ids.push(group.producer_agent_id.clone());
-    for id in &agent_ids {
-        let _ = run_openclaw(&["agents", "delete", id, "--yes"], None).await;
+
+    // 1a. Remove agent entries from openclaw.json `agents.list` (both dotted
+    //     and dashed forms — historically OpenClaw silently dashed the id on
+    //     `agents add`, and our rename only handled the active set).
+    let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
+    let mut list: serde_json::Value = serde_json::from_str(&agents_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    if let Some(arr) = list.as_array_mut() {
+        let drop_set: std::collections::HashSet<String> = agent_ids.iter()
+            .flat_map(|id| {
+                let dashed = id.replacen('.', "-", 1);
+                if dashed == *id { vec![id.clone()] } else { vec![id.clone(), dashed] }
+            })
+            .collect();
+        arr.retain(|a| {
+            let cur = a.get("id").and_then(|s| s.as_str()).unwrap_or("");
+            !drop_set.contains(cur)
+        });
     }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    // `--replace-path agents.list` makes the patch *replace* the array
+    // wholesale instead of recursively merging — needed for removal.
+    let _ = run_openclaw(
+        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+        Some(payload_s.as_bytes()),
+    ).await?;
 
     let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
     let home_path = std::path::PathBuf::from(&home);
 
-    // 2. delete agent dirs (in case `agents delete` left them)
+    // 1b. Remove the agent's own state dir (auth profiles + sessions — these
+    //     live entirely under ~/.openclaw/agents/<id>/ and never contain user
+    //     project data). Try both id forms.
     for id in &agent_ids {
-        let dir = home_path.join(".openclaw").join("agents").join(id);
-        let _ = std::fs::remove_dir_all(&dir);
+        let dotted = home_path.join(".openclaw").join("agents").join(id);
+        let _ = std::fs::remove_dir_all(&dotted);
+        let dashed_id = id.replacen('.', "-", 1);
+        if dashed_id != *id {
+            let dashed = home_path.join(".openclaw").join("agents").join(&dashed_id);
+            let _ = std::fs::remove_dir_all(&dashed);
+        }
     }
 
     // 3. delete team-prompt files
@@ -1046,6 +1089,486 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
     write_groups_file(&file)?;
     let _ = run_openclaw(&["gateway", "restart"], None).await;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// groups_add_specialist / groups_remove_specialist
+// Per-specialist editing of an existing group. These mirror the single-agent
+// portion of groups_create and the safe (workspace-untouching) portion of
+// groups_remove respectively.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Add a new specialist to an existing group. Same flow as one iteration of
+/// groups_create's specialist loop: `openclaw agents add` with the group's
+/// existing workspace, dotted-id rename, systemPromptOverride wire-up, auth
+/// mirror, team-prompt file, append to group's specialists, restart gateway.
+#[tauri::command]
+async fn groups_add_specialist(group_id: String, spec: AgentSpec) -> Result<Group, String> {
+    // 1. Validate
+    if spec.id.is_empty() || spec.id.len() > 20
+        || !spec.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("invalid role id '{}' — kebab-case, ≤20 chars", spec.id));
+    }
+    if spec.id == "producer" {
+        return Err("'producer' is reserved — every group has exactly one Producer".into());
+    }
+    if spec.system_prompt.trim().len() < 50 {
+        return Err(format!("system prompt is too short ({} chars; need ≥50)", spec.system_prompt.len()));
+    }
+
+    let mut file = read_groups_file()?;
+    let idx = file.groups.iter().position(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?;
+    let group = file.groups[idx].clone();
+
+    let qualified_id = format!("{}.{}", group.id, spec.id);
+    if group.specialists.iter().any(|s| s == &qualified_id) {
+        return Err(format!("specialist '{}' already exists in group '{}'", spec.id, group.id));
+    }
+
+    // 2. Workspace safety: refuse if the group's workspace dir is gone — we
+    // don't want to silently re-create an agent pointing at nothing, and the
+    // openclaw agents add would fail anyway.
+    if !std::path::PathBuf::from(&group.workspace).is_dir() {
+        return Err(format!("group's workspace no longer exists: {} — fix or recreate the group", group.workspace));
+    }
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let home_path = std::path::PathBuf::from(&home);
+    let openclaw_root = home_path.join(".openclaw");
+    let agents_root = openclaw_root.join("agents");
+    let prompts_root = openclaw_root.join("team-prompts");
+    let auth_src = agents_root.join("main").join("agent").join("auth-profiles.json");
+
+    let agent_dir = agents_root.join(&qualified_id);
+    let agent_dir_str = agent_dir.to_string_lossy().to_string();
+
+    // 3. openclaw agents add
+    let r = run_openclaw(&[
+        "agents", "add", &qualified_id,
+        "--non-interactive",
+        "--workspace", &group.workspace,
+        "--model", &spec.model,
+        "--agent-dir", &agent_dir_str,
+    ], None).await;
+    if let Err(e) = r {
+        return Err(format!("agents add {qualified_id} failed: {e}"));
+    }
+
+    // OpenClaw silently uses the dashed form on disk even when we hand it
+    // `--agent-dir <dotted>`. Result: the agentDir field in config points at a
+    // path that doesn't exist; the real state lives at the dashed sibling.
+    // Move it back so disk == config. (Same trick is done implicitly for
+    // groups_create's full set; here we have a single new agent.)
+    let dashed_id_disk = qualified_id.replacen('.', "-", 1);
+    let dashed_dir = agents_root.join(&dashed_id_disk);
+    if dashed_dir.exists() && !agent_dir.exists() {
+        let _ = std::fs::rename(&dashed_dir, &agent_dir);
+    }
+
+    // Mirror auth profiles (now that agent_dir definitely exists) + write
+    // team-prompt + set identity.
+    let _ = std::fs::copy(&auth_src, agent_dir.join("auth-profiles.json"));
+    let prompt_file = prompts_root.join(format!("{}.{}.md", group.id, spec.id));
+    if let Err(e) = std::fs::write(&prompt_file, &spec.system_prompt) {
+        return Err(format!("write prompt {prompt_file:?}: {e}"));
+    }
+    let _ = run_openclaw(&[
+        "agents", "set-identity",
+        "--agent", &qualified_id,
+        "--name", &capitalize(&spec.id),
+        "--emoji", &spec.emoji,
+    ], None).await;
+
+    // 4. Dotted-id rename + systemPromptOverride wiring in agents.list
+    let list_json = run_openclaw(&["config", "get", "agents.list"], None).await
+        .map_err(|e| format!("read agents.list: {e}"))?;
+    let mut list: serde_json::Value = serde_json::from_str(&list_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    let dashed_id = qualified_id.replacen('.', "-", 1);
+    if let Some(arr) = list.as_array_mut() {
+        for a in arr.iter_mut() {
+            let current_id = a.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if current_id == qualified_id || current_id == dashed_id {
+                if let Some(obj) = a.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::Value::String(qualified_id.clone()));
+                    if obj.contains_key("name") {
+                        obj.insert("name".to_string(), serde_json::Value::String(qualified_id.clone()));
+                    }
+                    obj.insert("systemPromptOverride".to_string(),
+                               serde_json::Value::String(spec.system_prompt.clone()));
+                }
+                break;
+            }
+        }
+    }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let _ = run_openclaw(
+        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+        Some(payload_s.as_bytes()),
+    ).await?;
+
+    // 5. Append to group's specialists + update thinking
+    file.groups[idx].specialists.push(qualified_id.clone());
+    write_groups_file(&file)?;
+
+    if !spec.thinking.is_empty() && spec.thinking != "off" {
+        let mut ct = read_crime_team_json();
+        if !ct.is_object() { ct = serde_json::json!({}); }
+        let obj = ct.as_object_mut().unwrap();
+        let group_thinking = obj.entry("perGroupThinking".to_string()).or_insert_with(|| serde_json::json!({}));
+        let role_map_entry = group_thinking.as_object_mut().unwrap()
+            .entry(group.id.clone()).or_insert_with(|| serde_json::json!({}));
+        role_map_entry.as_object_mut().unwrap()
+            .insert(spec.id.clone(), serde_json::Value::String(spec.thinking.clone()));
+        let _ = write_crime_team_json(&ct);
+    }
+
+    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    Ok(file.groups[idx].clone())
+}
+
+/// Rename a specialist's role id within a group. Touches every place the id
+/// is recorded: agent dir on disk, team-prompt file, openclaw.json (id +
+/// agentDir + name), groups.json (specialists array), .crime-team.json
+/// (perGroupThinking entry). Restarts gateway. Does NOT touch the workspace.
+#[tauri::command]
+async fn groups_rename_specialist(
+    group_id: String,
+    old_role: String,
+    new_role: String,
+) -> Result<Group, String> {
+    if new_role.is_empty() || new_role.len() > 20
+        || !new_role.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("invalid role id '{new_role}' — kebab-case, ≤20 chars"));
+    }
+    if new_role == "producer" {
+        return Err("'producer' is reserved".into());
+    }
+    if new_role == old_role {
+        return Err("new id is the same as old".into());
+    }
+
+    let mut file = read_groups_file()?;
+    let idx = file.groups.iter().position(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?;
+    let group = file.groups[idx].clone();
+
+    let old_qid = format!("{}.{}", group.id, old_role);
+    let new_qid = format!("{}.{}", group.id, new_role);
+
+    if !group.specialists.iter().any(|s| s == &old_qid) {
+        return Err(format!("specialist '{old_role}' is not in group '{}'", group.id));
+    }
+    if group.specialists.iter().any(|s| s == &new_qid) {
+        return Err(format!("specialist '{new_role}' already exists in group '{}'", group.id));
+    }
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let home_path = std::path::PathBuf::from(&home);
+    let agents_root = home_path.join(".openclaw").join("agents");
+    let prompts_root = home_path.join(".openclaw").join("team-prompts");
+
+    // 1. Rename agent dir on disk (try dotted then dashed; either is fine)
+    let new_dir = agents_root.join(&new_qid);
+    if new_dir.exists() {
+        return Err(format!("destination dir already exists: {}", new_dir.display()));
+    }
+    let old_dir_dotted = agents_root.join(&old_qid);
+    let old_dir_dashed = agents_root.join(old_qid.replacen('.', "-", 1));
+    if old_dir_dotted.exists() {
+        std::fs::rename(&old_dir_dotted, &new_dir)
+            .map_err(|e| format!("rename agent dir (dotted): {e}"))?;
+    } else if old_dir_dashed.exists() {
+        std::fs::rename(&old_dir_dashed, &new_dir)
+            .map_err(|e| format!("rename agent dir (dashed): {e}"))?;
+    }
+    // If neither exists the agent never had any state — just rename config.
+
+    // 2. Rename team-prompt file
+    let old_prompt = prompts_root.join(format!("{}.{}.md", group.id, old_role));
+    let new_prompt = prompts_root.join(format!("{}.{}.md", group.id, new_role));
+    if old_prompt.exists() {
+        let _ = std::fs::rename(&old_prompt, &new_prompt);
+    }
+
+    // 3. Patch openclaw.json — update id + agentDir + (optional) name field
+    let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
+    let mut list: serde_json::Value = serde_json::from_str(&agents_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    if let Some(arr) = list.as_array_mut() {
+        let old_dashed = old_qid.replacen('.', "-", 1);
+        for a in arr.iter_mut() {
+            let cur = a.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            if cur == old_qid || cur == old_dashed {
+                if let Some(obj) = a.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::Value::String(new_qid.clone()));
+                    if obj.contains_key("name") {
+                        obj.insert("name".to_string(), serde_json::Value::String(new_qid.clone()));
+                    }
+                    if obj.contains_key("agentDir") {
+                        obj.insert("agentDir".to_string(),
+                                   serde_json::Value::String(new_dir.to_string_lossy().to_string()));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let _ = run_openclaw(
+        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+        Some(payload_s.as_bytes()),
+    ).await?;
+
+    // 4. Update groups.json specialists array
+    if let Some(pos) = file.groups[idx].specialists.iter().position(|s| s == &old_qid) {
+        file.groups[idx].specialists[pos] = new_qid.clone();
+    }
+    write_groups_file(&file)?;
+
+    // 5. Move .crime-team.json perGroupThinking entry
+    let mut ct = read_crime_team_json();
+    if let Some(obj) = ct.as_object_mut() {
+        if let Some(map) = obj.get_mut("perGroupThinking").and_then(|m| m.as_object_mut()) {
+            if let Some(group_map) = map.get_mut(&group.id).and_then(|m| m.as_object_mut()) {
+                if let Some(v) = group_map.remove(&old_role) {
+                    group_map.insert(new_role.clone(), v);
+                }
+            }
+        }
+    }
+    let _ = write_crime_team_json(&ct);
+
+    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    Ok(file.groups[idx].clone())
+}
+
+/// Ask this group's Producer to draft a system prompt for a new specialist
+/// from a one-liner brief. The Producer already knows the team + workspace +
+/// existing specialists' tone, so it's the natural author. The user sees the
+/// returned text in the textarea, edits if needed, then submits via add.
+#[tauri::command]
+async fn groups_generate_specialist_prompt(
+    group_id: String,
+    role: String,
+    brief: String,
+) -> Result<String, String> {
+    if role.trim().is_empty() { return Err("role id required".into()); }
+    if brief.trim().is_empty() { return Err("brief required — describe what this specialist should do".into()); }
+
+    let file = read_groups_file()?;
+    let group = file.groups.iter().find(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?
+        .clone();
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let prompts_dir = std::path::PathBuf::from(&home).join(".openclaw").join("team-prompts");
+
+    // Pull existing specialists' prompts (≤1.5KB each, ≤6KB total) so the
+    // generated prompt matches the team's voice and structure.
+    let mut existing = String::new();
+    for s in &group.specialists {
+        let role_name = s.strip_prefix(&format!("{}.", group.id)).unwrap_or(s);
+        let path = prompts_dir.join(format!("{}.{}.md", group.id, role_name));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let snippet: String = text.chars().take(1500).collect();
+            existing.push_str(&format!("=== existing specialist: {role_name} ===\n{snippet}\n\n"));
+            if existing.len() > 6000 { break; }
+        }
+    }
+    if existing.is_empty() { existing = "(this group has no other specialists yet)".to_string(); }
+
+    let meta = format!(
+"You are the Producer for the '{display}' agent team. Dan wants to add a new specialist and needs you to draft its system prompt.
+
+NEW SPECIALIST
+──────────────
+Role id:   {role}
+Workspace: {workspace}
+Operator's brief: {brief}
+
+EXISTING TEAM (for tone + structure reference — keep the style consistent)
+──────────────────────────────────────────────────────────────────────────
+{existing}
+
+TASK
+────
+Write the full system prompt for this new specialist. It should:
+  - Open with `# <Role> — {display}` (capitalize the role name nicely)
+  - One-paragraph role identity
+  - 'Owned domain' section — cite specific paths from the workspace (look at the existing specialists to see what kinds of paths exist)
+  - 'Always-read project context' section listing the 2-4 files the specialist should read first
+  - 2-4 invariants the specialist defends (non-negotiable rules tied to their domain)
+  - 'Voice' section: concise, no corporate softening, lead with results, no emoji
+  - A final 'DO NOT WRITE WORKSPACE SCAFFOLDING' section listing the openclaw bootstrap files (BOOTSTRAP.md, IDENTITY.md, SOUL.md, USER.md, AGENTS.md, HEARTBEAT.md, TOOLS.md, .openclaw/) the specialist must NEVER create in the workspace
+  - Length: 1500-3000 chars
+
+OUTPUT
+──────
+Return ONLY the system prompt text — no preamble, no explanation, no markdown fence, no quotes around the whole thing. Start directly with the `# <Role> — {display}` heading.",
+        display = group.display_name,
+        role = role,
+        workspace = group.workspace,
+        brief = brief,
+        existing = existing,
+    );
+
+    // Cap at ~22KB so argv fits on Windows.
+    let meta = if meta.len() > 22000 {
+        format!("{}\n[…truncated at 22000 chars to fit argv…]", &meta[..22000])
+    } else {
+        meta
+    };
+
+    let reply = run_openclaw(&[
+        "agent",
+        "--agent", &group.producer_agent_id,
+        "--message", &meta,
+    ], None).await
+        .map_err(|e| format!("Producer call failed: {e}"))?;
+
+    Ok(reply.trim().to_string())
+}
+
+/// Ask the ACTIVE group's Producer to polish a fuzzy user brief into a full
+/// task prompt suitable for the chat box. Sister to
+/// groups_generate_specialist_prompt but aimed at the main task input — turns
+/// "audit auth stuff" into a structured Findings-style prompt with scope,
+/// dispatch directive, citation requirement, and synthesis instructions.
+#[tauri::command]
+async fn chat_generate_task_prompt(brief: String) -> Result<String, String> {
+    if brief.trim().is_empty() {
+        return Err("brief required — type a one-liner of what you want done".into());
+    }
+    let file = read_groups_file()?;
+    let group = file.groups.iter().find(|g| g.id == file.active_group_id)
+        .ok_or_else(|| "no active group".to_string())?
+        .clone();
+
+    // Roster line so Producer can name the right specialists in the dispatch.
+    let roster: Vec<String> = group.specialists.iter()
+        .map(|s| s.strip_prefix(&format!("{}.", group.id)).unwrap_or(s).to_string())
+        .collect();
+
+    let meta = format!(
+"You are the Producer for the '{display}' agent team. Dan typed a short brief in the task box and pressed 'Generate' to ask you to polish it into a proper task prompt before running.
+
+DAN'S BRIEF
+───────────
+{brief}
+
+YOUR TEAM (specialists you'll dispatch to)
+──────────────────────────────────────────
+{roster}
+
+TASK
+────
+Rewrite Dan's brief as a complete task prompt for this team. The polished prompt should:
+  - Open with the actual goal (one or two sentences) — read-only Findings unless Dan explicitly wants code changes
+  - State the scope clearly (which areas of the codebase, what to ignore)
+  - End with a dispatch directive — \"Dispatch in parallel to every relevant specialist; synthesize into ONE integrated report.\" — so the orchestrator's full-roster enforcement engages
+  - Ask for specific file:line citations (the orchestrator auto-verifies them)
+  - Skip generic preamble. No 'You are a helpful assistant.' Just the task.
+  - Aim for 4-10 lines. Punchy.
+
+OUTPUT
+──────
+Return ONLY the polished task prompt — no preamble, no explanation, no markdown fence, no quotes around the whole thing. Just the prompt text Dan will paste-or-edit and click Run.",
+        display = group.display_name,
+        brief = brief,
+        roster = roster.join(", "),
+    );
+
+    let meta = if meta.len() > 22000 {
+        format!("{}\n[…truncated at 22000 chars to fit argv…]", &meta[..22000])
+    } else {
+        meta
+    };
+
+    let reply = run_openclaw(&[
+        "agent",
+        "--agent", &group.producer_agent_id,
+        "--message", &meta,
+    ], None).await
+        .map_err(|e| format!("Producer call failed: {e}"))?;
+
+    Ok(reply.trim().to_string())
+}
+
+/// Remove a specialist from an existing group.
+///
+/// CRITICAL SAFETY: this command MUST NOT call `openclaw agents delete`. That
+/// command moves the agent's workspace (= user's PROJECT DIRECTORY) to
+/// ~/.Trash. See groups_remove for the full incident write-up. Instead this
+/// edits openclaw.json directly to drop the agent entry, and only removes the
+/// agent's home dir under ~/.openclaw/agents/<id>/ (auth + sessions). The
+/// workspace path is never touched.
+#[tauri::command]
+async fn groups_remove_specialist(group_id: String, role: String) -> Result<Group, String> {
+    let mut file = read_groups_file()?;
+    let idx = file.groups.iter().position(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?;
+    let group = file.groups[idx].clone();
+
+    if group.specialists.len() <= 1 {
+        return Err("cannot remove the last specialist — a group needs at least one".into());
+    }
+    let qualified_id = format!("{}.{}", group.id, role);
+    if !group.specialists.iter().any(|s| s == &qualified_id) {
+        return Err(format!("specialist '{}' is not in group '{}'", role, group.id));
+    }
+
+    let dashed_id = qualified_id.replacen('.', "-", 1);
+
+    // 1. Drop the entry from openclaw.json `agents.list` (both id forms)
+    let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
+    let mut list: serde_json::Value = serde_json::from_str(&agents_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    if let Some(arr) = list.as_array_mut() {
+        arr.retain(|a| {
+            let cur = a.get("id").and_then(|s| s.as_str()).unwrap_or("");
+            cur != qualified_id && cur != dashed_id
+        });
+    }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    // `--replace-path agents.list` makes the patch *replace* the array
+    // wholesale instead of recursively merging — needed for removal.
+    let _ = run_openclaw(
+        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+        Some(payload_s.as_bytes()),
+    ).await?;
+
+    // 2. Remove agent's own home dir (auth + sessions — NEVER the workspace)
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let home_path = std::path::PathBuf::from(&home);
+    let _ = std::fs::remove_dir_all(home_path.join(".openclaw").join("agents").join(&qualified_id));
+    let _ = std::fs::remove_dir_all(home_path.join(".openclaw").join("agents").join(&dashed_id));
+
+    // 3. Remove team-prompt file
+    let prompt_file = home_path.join(".openclaw").join("team-prompts")
+        .join(format!("{}.{}.md", group.id, role));
+    let _ = std::fs::remove_file(&prompt_file);
+
+    // 4. Drop from group's specialists + clear per-group thinking entry
+    file.groups[idx].specialists.retain(|s| s != &qualified_id);
+    write_groups_file(&file)?;
+
+    let mut ct = read_crime_team_json();
+    if let Some(obj) = ct.as_object_mut() {
+        if let Some(map) = obj.get_mut("perGroupThinking").and_then(|m| m.as_object_mut()) {
+            if let Some(group_map) = map.get_mut(&group.id).and_then(|m| m.as_object_mut()) {
+                group_map.remove(&role);
+            }
+        }
+    }
+    let _ = write_crime_team_json(&ct);
+
+    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    Ok(file.groups[idx].clone())
 }
 
 /// Read a group's presets.json from disk. Returns None if the file doesn't
@@ -1539,6 +2062,11 @@ pub fn run() {
             groups_remove,
             groups_get_prompt,
             groups_set_prompt,
+            groups_add_specialist,
+            groups_remove_specialist,
+            groups_rename_specialist,
+            groups_generate_specialist_prompt,
+            chat_generate_task_prompt,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

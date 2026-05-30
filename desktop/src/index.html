@@ -58,6 +58,7 @@
               <input type="number" id="timeoutInput" value="1800" min="60" step="60" />
             </label>
             <div class="composer-actions">
+              <button id="generateTaskBtn" title="Type a brief, click Generate, and the active group's Producer polishes it into a full task prompt.">Generate</button>
               <button id="cancelBtn" class="danger" disabled>Cancel</button>
               <button id="runBtn" class="primary">Run</button>
             </div>
@@ -199,9 +200,34 @@
             <h3>Agents — primary model + thinking</h3>
             <p class="muted">Each agent's primary model and thinking level for this group. Changes save when you click Save changes (gateway restart included).</p>
             <table class="settings-table" id="egAgentsTable">
-              <thead><tr><th>Agent</th><th>Current</th><th>Set primary to</th><th>Thinking</th></tr></thead>
+              <thead><tr><th>Agent</th><th>Current</th><th>Set primary to</th><th>Thinking</th><th></th></tr></thead>
               <tbody></tbody>
             </table>
+            <details class="add-form" id="egAddSpecialistForm">
+              <summary>+ Add a specialist to this group</summary>
+              <div class="form-grid">
+                <label><span>Role id (kebab-case, ≤20)</span>
+                  <input type="text" id="egNewSpecId" placeholder="e.g. security" maxlength="20" />
+                </label>
+                <label><span>Emoji</span>
+                  <input type="text" id="egNewSpecEmoji" placeholder="🛡️" maxlength="4" value="🤖" />
+                </label>
+                <label><span>Model</span>
+                  <select id="egNewSpecModel"></select>
+                </label>
+                <label><span>Thinking</span>
+                  <select id="egNewSpecThinking"></select>
+                </label>
+                <label class="full"><span>System prompt — write the full prompt OR type a brief and click Generate</span>
+                  <textarea id="egNewSpecPrompt" rows="8" placeholder="Brief: e.g. 'audit auth flows, secret handling, injection surfaces'  →  click Generate for Producer to draft a full prompt. Or write the full prompt yourself."></textarea>
+                </label>
+              </div>
+              <div class="form-actions">
+                <button id="egGenerateSpecBtn" class="small">Generate from brief</button>
+                <button id="egAddSpecBtn" class="primary small">Add specialist</button>
+                <span id="egAddSpecStatus" class="muted"></span>
+              </div>
+            </details>
           </section>
 
           <section class="settings-section">

@@ -9,9 +9,9 @@
       "sandbox-dsl": "high"
     },
     "crime-team-orchestra": {
-      "backend": "low",
-      "desktop": "low",
-      "producer": "high"
+      "producer": "max",
+      "qa": "low",
+      "ui-ux": "max"
     },
     "crimeos": {
       "architect": "high",
@@ -20,14 +20,6 @@
       "producer": "high",
       "qa": "medium",
       "security": "max"
-    },
-    "servuo": {
-      "build-ops": "medium",
-      "content-dev": "medium",
-      "crash-doctor": "high",
-      "producer": "max",
-      "server-core": "high",
-      "world-data": "medium"
     }
   }
 }
