@@ -27,7 +27,16 @@ function loadAgentModels(): Map<string, string> {
     const home = process.env.USERPROFILE || process.env.HOME || "";
     const cfg = JSON.parse(readFileSync(join(home, ".openclaw", "openclaw.json"), "utf8"));
     for (const a of (cfg?.agents?.list ?? [])) {
-      if (a?.id && a?.model) map.set(String(a.id), String(a.model));
+      if (!a?.id) continue;
+      // The `model` field is sometimes a string ("anthropic/claude-opus-4-7")
+      // and sometimes an object ({ primary, fallbacks }). Normalize to the
+      // primary string — otherwise String(obj) → "[object Object]" and the
+      // Opus check below silently fails, downgrading max→high for every
+      // Opus-Producer run.
+      let model: string | null = null;
+      if (typeof a.model === "string") model = a.model;
+      else if (a.model && typeof a.model === "object" && typeof a.model.primary === "string") model = a.model.primary;
+      if (model) map.set(String(a.id), model);
     }
   } catch {
     // Best-effort. If we can't read it, just don't clamp.
