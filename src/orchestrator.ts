@@ -118,6 +118,9 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
 
     record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId);
     await persist();
+    printCoderReport(record.coderResult, 1, opts.cfg.activeGroup.coderAgentId
+      ? roleOf(opts.cfg.activeGroup.coderAgentId, opts.cfg.activeGroup.id)
+      : "coder");
     if (!record.coderResult.ok) {
       log("warn", "Coder failed; skipping any loop iterations");
       record.endedAt = new Date().toISOString();
@@ -178,6 +181,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
         const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId);
         iterEntry.coder = coderN;
         await persist();
+        printCoderReport(coderN, iter, roleOf(coderId, opts.cfg.activeGroup.id));
         if (!coderN.ok) {
           log("warn", `iter ${iter} Coder failed; stopping loop`);
           break;
@@ -744,6 +748,30 @@ function printRawReplies(results: DispatchResult[]) {
     console.log(chalk.bold.cyan(`=== ${r.agent} ===`));
     console.log(r.reply);
   }
+}
+
+/**
+ * G.2/G.3 — print the Coder's reply with a clear header so the GUI's
+ * answer-panel collector (main.js — captures everything between
+ * "PRODUCER'S INTEGRATED ANSWER" and "[ ok  ] done.") includes the diff +
+ * touched-files summary alongside the audit integration. Without this the
+ * Coder reply lives only in the run record JSON and the user sees a generic
+ * audit-style answer with no indication of what was actually changed.
+ */
+function printCoderReport(
+  result: { ok: boolean; reply: string; durationMs: number },
+  iteration: number,
+  coderRole: string,
+) {
+  const headerColor = result.ok ? chalk.bold.yellow : chalk.bold.red;
+  const statusWord = result.ok ? "REPORT" : "FAILED";
+  const iterTag = iteration > 1 ? ` (iteration ${iteration})` : "";
+  console.log();
+  console.log(headerColor("=".repeat(72)));
+  console.log(headerColor(`CODER ${statusWord} — ${coderRole}${iterTag} — ${(result.durationMs/1000).toFixed(1)}s`));
+  console.log(headerColor("=".repeat(72)));
+  console.log(result.reply);
+  console.log();
 }
 
 function hasDispatchDirective(task: string): boolean {
