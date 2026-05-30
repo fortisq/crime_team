@@ -76,6 +76,11 @@ const els = {
   runBtn:      document.getElementById("runBtn"),
   generateBtn: document.getElementById("generateTaskBtn"),
   cancelBtn:   document.getElementById("cancelBtn"),
+  useCoder:    document.getElementById("useCoderInput"),
+  useCoderWrap:document.getElementById("useCoderWrap"),
+  loop:        document.getElementById("loopInput"),
+  loopWrap:    document.getElementById("loopWrap"),
+  loopMax:     document.getElementById("loopMaxInput"),
   newRunBtn:   document.getElementById("newRunBtn"),
   statusSec:   document.getElementById("statusSection"),
   logSec:      document.getElementById("logSection"),
@@ -402,6 +407,56 @@ async function startRun() {
   const task = els.taskInput.value.trim();
   if (!task) { els.taskInput.focus(); return; }
 
+  // G.2 — workspace cleanliness guard. Refuse if the tree is dirty (no
+  // override); confirm once if it's not a git repo at all. Runs BEFORE we
+  // spawn anything so a failed guard doesn't leave a half-set-up run state.
+  const useCoder = !!els.useCoder?.checked;
+  if (useCoder) {
+    if (!activeGroup?.coderAgentId) {
+      await confirmDialog({
+        title: "No Coder agent on this group",
+        body: "The 'Use Coder' box is checked but the active group has no Coder. Add one via Edit Group → '+ Add a specialist' → tick 'Coder agent'.",
+        confirmLabel: "OK",
+        destructive: true,
+      });
+      return;
+    }
+    try {
+      const report = await invoke("chat_check_workspace_clean", { groupId: activeGroup.id });
+      if (!report.clean) {
+        const sample = report.dirtyPaths.slice(0, 8).join("\n  ");
+        const more = report.dirtyCount > 8 ? `\n  …and ${report.dirtyCount - 8} more` : "";
+        await confirmDialog({
+          title: "Workspace has uncommitted changes",
+          body:
+            `The Coder agent edits files in the workspace. To keep its changes recoverable, commit or stash the working tree first.\n\n` +
+            `Dirty entries:\n  ${sample}${more}\n\n` +
+            `Commit or stash, then click Run again.`,
+          confirmLabel: "OK",
+          destructive: true,
+        });
+        return;
+      }
+      if (!report.isGitRepo) {
+        const ok = await confirmDialog({
+          title: "Workspace is not a git repository",
+          body: `The workspace at ${activeGroup.workspace} is not a git repo. The Coder will still run, but its changes won't be recoverable via 'git restore'. Proceed?`,
+          confirmLabel: "Proceed without git",
+          destructive: true,
+        });
+        if (!ok) return;
+      }
+    } catch (e) {
+      const ok = await confirmDialog({
+        title: "Could not check workspace state",
+        body: `${String(e).slice(0, 400)}\n\nProceed anyway?`,
+        confirmLabel: "Proceed",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+  }
+
   activeRun = { id: null, startedAt: new Date().toISOString(), agents: new Map(), log: [], answer: null };
   collectingAnswer = false;
   answerBuf = "";
@@ -420,12 +475,17 @@ async function startRun() {
   setAgent("producer", { status: "running", label: "planning…" });
   startElapsedTimer();
 
+  // G.3 — loopMax: send 1 if loop unchecked (orchestrator treats <=1 as "no loop")
+  const loopMax = (useCoder && els.loop?.checked) ? Math.max(1, Math.min(5, Number(els.loopMax.value) || 1)) : 1;
+
   try {
     await invoke("run_task", {
       task,
       verbose: els.verbose.checked,
       smartDispatch: els.smart?.checked === true,
       timeoutSec: Number(els.timeout.value) || 1800,
+      useCoder,
+      loopMax,
     });
   } catch (e) {
     appendLogLine(`[error] failed to start: ${e}`);
@@ -434,6 +494,19 @@ async function startRun() {
 }
 
 async function cancelRun() {
+  // G.3 — when a loop is in flight, prefer soft cancel (stops between
+  // iterations, lets the current openclaw finish cleanly). Hard kill is the
+  // fallback for everything else (single-pass audits, single-pass Coder).
+  const usingLoop = els.useCoder?.checked && els.loop?.checked && Number(els.loopMax?.value) > 1;
+  if (usingLoop) {
+    appendLogLine("[warn ] soft-cancel requested — will stop after current iteration");
+    try {
+      await invoke("cancel_run_soft");
+      return;
+    } catch (e) {
+      appendLogLine(`[warn ] soft-cancel failed (${e}), falling back to hard kill`);
+    }
+  }
   try {
     await invoke("cancel_run");
     appendLogLine("[warn ] cancel requested");
@@ -796,7 +869,7 @@ async function renderGroupsTable() {
       </td>
     `;
     tr.querySelector('[data-action="activate"]')?.addEventListener("click", async () => {
-      try { await invoke("groups_set_active", { groupId: g.id }); await loadGroups(); await loadPresetsForActiveGroup(); populatePresets(); await refreshRuns(); await renderGroupsTable(); }
+      try { await invoke("groups_set_active", { groupId: g.id }); await loadGroups(); await loadPresetsForActiveGroup(); populatePresets(); refreshComposerCoderUI(); await refreshRuns(); await renderGroupsTable(); }
       catch (e) { alert("activate failed: " + e); }
     });
     tr.querySelector('[data-action="edit"]')?.addEventListener("click", () => openEditGroup(g));
@@ -890,6 +963,27 @@ async function openEditGroup(group) {
       };
     }
   }
+  // G.1 Coder toggle — wire once, then sync the form to its current state
+  const kindToggle = document.getElementById("egNewSpecKindCoder");
+  if (kindToggle && !kindToggle.dataset.wired) {
+    kindToggle.addEventListener("change", () => applyCoderKindUI(kindToggle.checked));
+    kindToggle.dataset.wired = "1";
+  }
+  // If this group already has a Coder, disable the toggle with a tooltip
+  // (clearer than hiding — discoverability + explanation).
+  if (kindToggle) {
+    const hasCoder = !!egState.group.coderAgentId;
+    kindToggle.checked = false;
+    kindToggle.disabled = hasCoder;
+    const kindRow = document.getElementById("egNewSpecKindRow");
+    if (kindRow) {
+      kindRow.title = hasCoder
+        ? `This group already has a Coder agent (${egState.group.coderAgentId.split(".").slice(1).join(".")}). Remove it first to add a new one.`
+        : "";
+      kindRow.classList.toggle("disabled", hasCoder);
+    }
+    applyCoderKindUI(false);  // reset form to audit mode on every open
+  }
   const addBtn = document.getElementById("egAddSpecBtn");
   if (addBtn && !addBtn.dataset.wired) {
     // Bind once. preventDefault stops the <details> form's default submit.
@@ -929,24 +1023,31 @@ function renderEgAgentsTable(agents) {
   egEls.agentsTbody.innerHTML = "";
   const all = allCatalogedModels();
   // Producer can never be removed (a group always has exactly one). The last
-  // specialist also can't be removed — Rust enforces that, but we disable the
-  // button here for clearer UX.
+  // AUDIT specialist also can't be removed — Rust enforces that, but we
+  // disable the button here for clearer UX. Coder doesn't count toward the
+  // minimum and can always be removed.
   const producerId = egState.group.producerAgentId;
-  const specialistCount = egState.group.specialists.length;
+  const coderId = egState.group.coderAgentId;
+  const auditCount = egState.group.specialists.filter(s => s !== coderId).length;
 
   for (const a of agents) {
     const role = a.id.startsWith(egState.group.id + ".") ? a.id.slice(egState.group.id.length + 1) : a.id;
     const isProducer = a.id === producerId;
-    const isLastSpecialist = !isProducer && specialistCount <= 1;
+    const isCoder = a.id === coderId;
+    const isLastAudit = !isProducer && !isCoder && auditCount <= 1;
     const options = new Set(all);
     if (a.primary) options.add(a.primary);
     const sortedOpts = Array.from(options).sort();
     const thinkingLevels = thinkingLevelsFor(a.primary);
     const currentThinking = a.thinking ?? "";
 
+    const roleCell = isCoder
+      ? `${emoji(a.id)} ${escapeHtml(role)} <span class="role-chip coder-chip" title="Coder agent — excluded from normal audit dispatch. Runs only when 'Use Coder' is checked on the composer.">Coder</span>`
+      : `${emoji(a.id)} ${escapeHtml(role)}`;
+
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${emoji(a.id)} ${escapeHtml(role)}</td>
+      <td>${roleCell}</td>
       <td class="mono">${escapeHtml(a.primary || "(none)")}</td>
       <td>
         <select data-agent="${escapeHtml(a.id)}" data-field="primary">
@@ -961,8 +1062,11 @@ function renderEgAgentsTable(agents) {
       <td class="row-actions">
         ${isProducer
           ? `<span class="muted" title="The Producer is required and can't be renamed or removed.">—</span>`
+          : isCoder
+          ? `<span class="muted" title="The Coder role id is fixed.">—</span>
+             <button class="danger small" data-remove-role="${escapeHtml(role)}">Remove</button>`
           : `<button class="small" data-rename-role="${escapeHtml(role)}">Rename</button>
-             <button class="danger small" data-remove-role="${escapeHtml(role)}"${isLastSpecialist ? ' disabled title="A group needs at least one specialist."' : ""}>Remove</button>`
+             <button class="danger small" data-remove-role="${escapeHtml(role)}"${isLastAudit ? ' disabled title="A group needs at least one audit specialist."' : ""}>Remove</button>`
         }
       </td>
     `;
@@ -1131,6 +1235,65 @@ async function removeSpecialist(role) {
 }
 
 /**
+ * G.1 — Shape-shift the Add Specialist form when the Coder toggle is on.
+ * Locks id/model/thinking, gates Add behind Generate (Coder prompts must be
+ * Producer-drafted), and swaps the Generate handler to the Coder-specific
+ * meta-prompt. Toggling off restores audit-mode defaults.
+ */
+function applyCoderKindUI(isCoder) {
+  const idInput = document.getElementById("egNewSpecId");
+  const emojiInput = document.getElementById("egNewSpecEmoji");
+  const modelSel = document.getElementById("egNewSpecModel");
+  const thinkSel = document.getElementById("egNewSpecThinking");
+  const promptArea = document.getElementById("egNewSpecPrompt");
+  const promptLabel = document.getElementById("egNewSpecPromptLabel");
+  const genBtn = document.getElementById("egGenerateSpecBtn");
+  const addBtn = document.getElementById("egAddSpecBtn");
+  if (!idInput || !modelSel || !thinkSel || !genBtn || !addBtn) return;
+
+  if (isCoder) {
+    idInput.value = "coder";
+    idInput.disabled = true;
+    if (emojiInput && (!emojiInput.value || emojiInput.value === "🤖")) emojiInput.value = "🛠";
+    // Force Opus + max — Coder is multi-file reasoning where max thinking pays off.
+    const opus = "anthropic/claude-opus-4-7";
+    if (![...modelSel.options].some(o => o.value === opus)) {
+      const opt = document.createElement("option");
+      opt.value = opus; opt.textContent = opus;
+      modelSel.appendChild(opt);
+    }
+    modelSel.value = opus;
+    modelSel.disabled = true;
+    modelSel.title = "Coder always uses Opus (multi-file reasoning).";
+    thinkSel.innerHTML = renderThinkingOptions(thinkingLevelsFor(opus), "max");
+    thinkSel.value = "max";
+    thinkSel.disabled = true;
+    thinkSel.title = "Coder always uses max thinking.";
+    if (promptLabel) promptLabel.textContent = "Coder system prompt — type a brief, then click Generate (Producer drafts it).";
+    promptArea.placeholder = "e.g. 'apply audit findings; small focused changes only; never touch identity files'  →  click Generate Coder prompt";
+    promptArea.value = ""; // clear any audit-mode text so the brief doesn't bleed in
+    genBtn.textContent = "Generate Coder prompt";
+    addBtn.disabled = true;  // re-enable only after Generate succeeds
+    addBtn.title = "Click Generate Coder prompt first — Coder prompts must be Producer-drafted.";
+  } else {
+    idInput.disabled = false;
+    if (idInput.value === "coder") idInput.value = "";
+    if (emojiInput && emojiInput.value === "🛠") emojiInput.value = "🤖";
+    modelSel.disabled = false;
+    modelSel.title = "";
+    modelSel.value = "anthropic/claude-sonnet-4-6";
+    thinkSel.innerHTML = renderThinkingOptions(thinkingLevelsFor(modelSel.value), "medium");
+    thinkSel.disabled = false;
+    thinkSel.title = "";
+    if (promptLabel) promptLabel.textContent = "System prompt — write the full prompt OR type a brief and click Generate";
+    promptArea.placeholder = "Brief: e.g. 'audit auth flows, secret handling, injection surfaces'  →  click Generate for Producer to draft a full prompt. Or write the full prompt yourself.";
+    genBtn.textContent = "Generate from brief";
+    addBtn.disabled = false;
+    addBtn.title = "";
+  }
+}
+
+/**
  * Ask this group's Producer to draft a system prompt for the new specialist
  * from whatever the user typed into the prompt field (which doubles as the
  * brief). Replaces the prompt textarea with Producer's reply on success so
@@ -1139,6 +1302,9 @@ async function removeSpecialist(role) {
  * Producer turns take 30-90s (claude-cli through the Max sub is the typical
  * path); the buttons are disabled the whole time so accidental double-fires
  * can't queue a second call.
+ *
+ * G.1 — when Coder toggle is on, routes to groups_generate_coder_prompt
+ * (different meta-template) instead.
  */
 async function generateSpecialistPrompt() {
   const id = document.getElementById("egNewSpecId").value.trim();
@@ -1146,26 +1312,29 @@ async function generateSpecialistPrompt() {
   const statusEl = document.getElementById("egAddSpecStatus");
   const genBtn = document.getElementById("egGenerateSpecBtn");
   const addBtn = document.getElementById("egAddSpecBtn");
+  const isCoder = document.getElementById("egNewSpecKindCoder")?.checked === true;
 
-  if (!id) { statusEl.textContent = "type a role id first"; return; }
+  if (!id && !isCoder) { statusEl.textContent = "type a role id first"; return; }
   if (!brief) { statusEl.textContent = "type a brief description of what this specialist should do"; return; }
 
-  statusEl.textContent = `asking ${egState.group.id} Producer to draft a prompt (typical 30-90s)…`;
+  statusEl.textContent = `asking ${egState.group.id} Producer to draft a ${isCoder ? "Coder " : ""}prompt (typical 30-90s)…`;
   genBtn.disabled = true;
   addBtn.disabled = true;
   try {
-    const generated = await invoke("groups_generate_specialist_prompt", {
-      groupId: egState.group.id,
-      role: id,
-      brief,
-    });
+    const generated = isCoder
+      ? await invoke("groups_generate_coder_prompt", { groupId: egState.group.id, brief })
+      : await invoke("groups_generate_specialist_prompt", { groupId: egState.group.id, role: id, brief });
     document.getElementById("egNewSpecPrompt").value = generated;
     statusEl.textContent = `Producer drafted ${generated.length} chars — review + edit + click Add specialist`;
+    // Coder path: Add was disabled by the toggle until Generate succeeds.
+    addBtn.disabled = false;
+    addBtn.title = "";
   } catch (e) {
     statusEl.textContent = `generate failed: ${String(e).slice(0, 200)}`;
   } finally {
     genBtn.disabled = false;
-    addBtn.disabled = false;
+    // For audit specialists, Add was already enabled. For Coder, we just
+    // re-enabled it on success above.
   }
 }
 
@@ -1175,10 +1344,13 @@ async function generateSpecialistPrompt() {
  * Edit Group so the new specialist appears in the agents table + prompt tabs.
  */
 async function addSpecialist() {
-  const id = document.getElementById("egNewSpecId").value.trim();
-  const emoji = document.getElementById("egNewSpecEmoji").value.trim() || "🤖";
-  const model = document.getElementById("egNewSpecModel").value;
-  const thinking = document.getElementById("egNewSpecThinking").value || "off";
+  const isCoder = document.getElementById("egNewSpecKindCoder")?.checked === true;
+  // Coder path: defense-in-depth — force id/model/thinking even if the DOM
+  // somehow got out of sync with applyCoderKindUI. Rust enforces too.
+  const id = isCoder ? "coder" : document.getElementById("egNewSpecId").value.trim();
+  const emoji = document.getElementById("egNewSpecEmoji").value.trim() || (isCoder ? "🛠" : "🤖");
+  const model = isCoder ? "anthropic/claude-opus-4-7" : document.getElementById("egNewSpecModel").value;
+  const thinking = isCoder ? "max" : (document.getElementById("egNewSpecThinking").value || "off");
   const systemPrompt = document.getElementById("egNewSpecPrompt").value;
   const statusEl = document.getElementById("egAddSpecStatus");
 
@@ -1188,8 +1360,9 @@ async function addSpecialist() {
     return;
   }
   if (id === "producer") { statusEl.textContent = "'producer' is reserved"; return; }
-  if (systemPrompt.trim().length < 50) {
-    statusEl.textContent = `system prompt too short (${systemPrompt.trim().length} chars; need ≥50)`;
+  const minLen = isCoder ? 200 : 50;
+  if (systemPrompt.trim().length < minLen) {
+    statusEl.textContent = `${isCoder ? "Coder " : ""}system prompt too short (${systemPrompt.trim().length} chars; need ≥${minLen})`;
     return;
   }
 
@@ -1197,7 +1370,7 @@ async function addSpecialist() {
   try {
     const updated = await invoke("groups_add_specialist", {
       groupId: egState.group.id,
-      spec: { id, emoji, model, thinking, systemPrompt },
+      spec: { id, emoji, model, thinking, systemPrompt, kind: isCoder ? "coder" : "audit" },
     });
     egState.group = updated;
     // Clear the form
@@ -1949,6 +2122,7 @@ els.groupSelect?.addEventListener("change", async () => {
     // Reload everything scoped to the new active group
     await loadPresetsForActiveGroup();
     populatePresets();
+    refreshComposerCoderUI();  // G.2/G.3 — show/hide Use Coder + Loop
     await refreshRuns();
     document.querySelectorAll(".run-item.active").forEach(el => el.classList.remove("active"));
     showSections({ status: false, log: false, answer: false });
@@ -1957,12 +2131,51 @@ els.groupSelect?.addEventListener("change", async () => {
   }
 });
 
+/**
+ * G.2/G.3 — refresh composer's Use Coder + Loop visibility based on active group.
+ * Called after every group switch and on initial load. The checkbox+input markup
+ * is always present; we toggle .hidden on the wrappers and clear state when
+ * not applicable.
+ */
+function refreshComposerCoderUI() {
+  const hasCoder = !!activeGroup?.coderAgentId;
+  if (els.useCoderWrap) els.useCoderWrap.classList.toggle("hidden", !hasCoder);
+  if (!hasCoder) {
+    if (els.useCoder) els.useCoder.checked = false;
+    if (els.loop) els.loop.checked = false;
+    if (els.loopWrap) els.loopWrap.classList.add("hidden");
+  } else if (els.loopWrap) {
+    els.loopWrap.classList.toggle("hidden", !els.useCoder?.checked);
+  }
+  if (els.loopMax) els.loopMax.disabled = !els.loop?.checked;
+}
+
+// Wire the new checkbox listeners ONCE (cascading visibility + state cleanup).
+if (els.useCoder) {
+  els.useCoder.addEventListener("change", () => {
+    if (!els.useCoder.checked && els.loop) els.loop.checked = false;
+    refreshComposerCoderUI();
+  });
+}
+if (els.loop) {
+  els.loop.addEventListener("change", () => refreshComposerCoderUI());
+}
+if (els.loopMax) {
+  els.loopMax.addEventListener("input", () => {
+    let v = Number(els.loopMax.value);
+    if (!Number.isFinite(v) || v < 1) v = 1;
+    if (v > 5) v = 5;
+    els.loopMax.value = String(v);
+  });
+}
+
 // Initial load
 (async () => {
   loadToggleState();
   await loadGroups();                  // sets activeGroup so the rest of the load knows scope
   await loadPresetsForActiveGroup();   // reads ~/.crime-team/groups/<active>/presets.json
   populatePresets();                   // builds dropdowns from PRESETS/ANGLES (group's or fallback)
+  refreshComposerCoderUI();            // G.2/G.3 — Use Coder + Loop conditional
   try { els.rootPath.textContent = await invoke("orchestrator_path"); } catch {}
   await refreshRuns();
 })();

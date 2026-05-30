@@ -136,6 +136,17 @@ export function loadConfig(): Config {
   return cfg;
 }
 
+/**
+ * The audit-only specialist roster = all specialists minus the optional Coder.
+ * This is who the orchestrator dispatches to during Phases 1–4. The Coder
+ * (if present) stays in `cfg.activeGroup.specialists` and OpenClaw config
+ * — only the audit-fan-out logic skips it.
+ */
+export function auditSpecialists(cfg: Config): string[] {
+  const coder = cfg.activeGroup.coderAgentId;
+  return cfg.activeGroup.specialists.filter(s => s !== coder);
+}
+
 /** Lookup the thinking level for an agent in the active group. */
 export function thinkingFor(cfg: Config, agentId: string): string {
   // agentId may be either fully-qualified ("crimeos.architect") or just role ("architect").

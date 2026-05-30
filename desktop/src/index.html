@@ -57,6 +57,17 @@
               <span>Timeout (s)</span>
               <input type="number" id="timeoutInput" value="1800" min="60" step="60" />
             </label>
+            <label class="check coder-check hidden" id="useCoderWrap"
+                   title="After the audit integrates, hand the report to this group's Coder agent to implement findings. Requires a Coder + a clean git working tree.">
+              <input type="checkbox" id="useCoderInput" />
+              <span>Use Coder</span>
+            </label>
+            <label class="check loop-check hidden" id="loopWrap"
+                   title="After the Coder finishes, re-audit the changes and let the Coder fix regressions, up to N times. Stops early on AUDIT CLEAN.">
+              <input type="checkbox" id="loopInput" />
+              <span>Loop</span>
+              <input type="number" id="loopMaxInput" value="3" min="1" max="5" step="1" class="loop-count" />
+            </label>
             <div class="composer-actions">
               <button id="generateTaskBtn" title="Type a brief, click Generate, and the active group's Producer polishes it into a full task prompt.">Generate</button>
               <button id="cancelBtn" class="danger" disabled>Cancel</button>
@@ -206,6 +217,10 @@
             <details class="add-form" id="egAddSpecialistForm">
               <summary>+ Add a specialist to this group</summary>
               <div class="form-grid">
+                <label class="full kind-toggle" id="egNewSpecKindRow">
+                  <input type="checkbox" id="egNewSpecKindCoder" />
+                  <span><strong>Coder agent</strong> <span class="muted">— workspace-write specialist that turns audit findings into code changes. At most one per group. Role id is fixed to <code>coder</code> and the system prompt is drafted by your Producer.</span></span>
+                </label>
                 <label><span>Role id (kebab-case, ≤20)</span>
                   <input type="text" id="egNewSpecId" placeholder="e.g. security" maxlength="20" />
                 </label>
@@ -218,7 +233,7 @@
                 <label><span>Thinking</span>
                   <select id="egNewSpecThinking"></select>
                 </label>
-                <label class="full"><span>System prompt — write the full prompt OR type a brief and click Generate</span>
+                <label class="full"><span id="egNewSpecPromptLabel">System prompt — write the full prompt OR type a brief and click Generate</span>
                   <textarea id="egNewSpecPrompt" rows="8" placeholder="Brief: e.g. 'audit auth flows, secret handling, injection surfaces'  →  click Generate for Producer to draft a full prompt. Or write the full prompt yourself."></textarea>
                 </label>
               </div>

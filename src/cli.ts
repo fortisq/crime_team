@@ -22,16 +22,24 @@ interface Args {
   help: boolean;
   smartDispatch: boolean;
   groupId?: string;
+  useCoder: boolean;
+  loopMax?: number;
 }
 
 function parseArgv(argv: string[]): Args {
-  const a: Args = { verbose: false, help: false, smartDispatch: false };
+  const a: Args = { verbose: false, help: false, smartDispatch: false, useCoder: false };
   const tokens = argv.slice(2);
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i]!;
     if (t === "--help" || t === "-h") a.help = true;
     else if (t === "--verbose" || t === "-v") a.verbose = true;
     else if (t === "--smart-dispatch" || t === "--smart") a.smartDispatch = true;
+    else if (t === "--use-coder") a.useCoder = true;
+    else if (t === "--loop") {
+      const n = Number(tokens[++i]);
+      if (!Number.isFinite(n) || n < 1 || n > 5) throw new Error("--loop expects 1..5");
+      a.loopMax = n;
+    }
     else if (t === "--resume") a.resume = tokens[++i];
     else if (t === "--timeout") a.timeout = Number(tokens[++i]);
     else if (t === "--group" || t === "-g") a.groupId = tokens[++i];
@@ -55,6 +63,10 @@ USAGE
 OPTIONS
   --verbose, -v       Print specialist replies inline
   --smart-dispatch    Producer judges which specialists this task needs
+  --use-coder         After audit integrates, hand off to the group's Coder
+                      agent to implement findings (requires a Coder + clean git tree)
+  --loop <N>          Loop audit→coder up to N times (1..5), stops early on
+                      AUDIT CLEAN sentinel. Only honored with --use-coder.
   --timeout <s>       Override per-call timeout in seconds
   --group, -g <id>    Group id (defaults to activeGroupId in ~/.crime-team/groups.json)
   --resume <id>       (planned) Resume an earlier run
@@ -118,6 +130,8 @@ async function main() {
     runId: args.resume,
     verbose: args.verbose,
     smartDispatch: args.smartDispatch,
+    useCoder: args.useCoder,
+    loopMax: args.loopMax,
   });
   process.exit(code);
 }

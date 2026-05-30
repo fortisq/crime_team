@@ -19,6 +19,13 @@ use tokio::process::{Child, Command};
 #[derive(Default)]
 struct RunState {
     child: Mutex<Option<Child>>,
+    /// G.3 — the runId of the currently in-flight run. Populated in run_task,
+    /// cleared on the done handler. Used by cancel_run_soft to write the
+    /// per-run marker file the orchestrator polls between loop iterations.
+    current_run_id: Mutex<Option<String>>,
+    /// G.3 — the group id of the currently in-flight run. Same lifecycle as
+    /// current_run_id; needed to locate runs/<gid>/<runId>.cancel.
+    current_group_id: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -72,6 +79,8 @@ async fn run_task(
     verbose: bool,
     timeout_sec: Option<u32>,
     smart_dispatch: Option<bool>,
+    use_coder: Option<bool>,   // G.2
+    loop_max: Option<u32>,     // G.3 (1 = no loop; 2..5 = loop wrapper)
 ) -> Result<String, String> {
     let root = orchestrator_root();
     let bin = root.join("bin").join("crime-team.mjs");
@@ -85,6 +94,13 @@ async fn run_task(
     let mut args: Vec<String> = vec![bin.to_string_lossy().to_string(), task];
     if verbose { args.push("--verbose".into()); }
     if smart_dispatch.unwrap_or(false) { args.push("--smart-dispatch".into()); }
+    if use_coder.unwrap_or(false) { args.push("--use-coder".into()); }
+    if let Some(n) = loop_max {
+        if n > 1 {
+            args.push("--loop".into());
+            args.push(n.to_string());
+        }
+    }
     if let Some(t) = timeout_sec {
         args.push("--timeout".into());
         args.push(t.to_string());
@@ -101,9 +117,19 @@ async fn run_task(
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
+    // G.3 — stash the runId + active group id so cancel_run_soft can write
+    // the marker file the orchestrator polls between loop iterations.
     {
         let mut slot = state.child.lock().unwrap();
         *slot = Some(child);
+    }
+    {
+        let mut id_slot = state.current_run_id.lock().unwrap();
+        *id_slot = Some(run_id.clone());
+    }
+    if let Ok(gid) = active_group_id_for_state() {
+        let mut g_slot = state.current_group_id.lock().unwrap();
+        *g_slot = Some(gid);
     }
 
     // stdout pump
@@ -158,6 +184,15 @@ async fn run_task(
         } else {
             None
         };
+        // G.3 — clear current_run_id + current_group_id now that the run is done.
+        {
+            let mut s = state_done.current_run_id.lock().unwrap();
+            *s = None;
+        }
+        {
+            let mut s = state_done.current_group_id.lock().unwrap();
+            *s = None;
+        }
         let _ = app_done.emit("orchestrator:done", RunDone {
             run_id: id_done,
             exit_code,
@@ -175,6 +210,43 @@ async fn cancel_run(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
         return Ok(true);
     }
     Ok(false)
+}
+
+/// G.3 — Soft cancel: write a per-run marker file the orchestrator polls
+/// between loop iterations. The current openclaw subprocess finishes
+/// naturally; the orchestrator exits cleanly before starting the next
+/// iteration. Hard `cancel_run` stays for the "kill everything now" case.
+///
+/// Returns true if a marker was written (run was in flight); false if there
+/// was no current run.
+#[tauri::command]
+async fn cancel_run_soft(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
+    let (run_id, group_id) = {
+        let r = state.current_run_id.lock().unwrap().clone();
+        let g = state.current_group_id.lock().unwrap().clone();
+        (r, g)
+    };
+    let (Some(run_id), Some(group_id)) = (run_id, group_id) else {
+        return Ok(false);
+    };
+    let marker = orchestrator_root()
+        .join("runs").join(&group_id)
+        .join(format!("{run_id}.cancel"));
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&marker, b"soft-cancel\n")
+        .map_err(|e| format!("write marker {}: {e}", marker.display()))?;
+    Ok(true)
+}
+
+/// Helper: read the currently-active group id from ~/.crime-team/groups.json.
+/// Used by run_task to stash it on RunState (separate from active_group_id()
+/// because that one errors with anyhow-style strings; this returns Result with
+/// just a string).
+fn active_group_id_for_state() -> Result<String, String> {
+    let file = read_groups_file()?;
+    Ok(file.active_group_id)
 }
 
 #[tauri::command]
@@ -249,6 +321,12 @@ struct Group {
     workspace: String,
     producer_agent_id: String,
     specialists: Vec<String>,
+    /// G.1 sidecar: fully-qualified id of the optional Coder agent. Always
+    /// also present in `specialists` (the Coder is a real OpenClaw agent like
+    /// any other). serde(default + skip_if_none) keeps round-trip clean for
+    /// pre-G.1 groups.json files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coder_agent_id: Option<String>,
     created_at: String,
     last_used_at: String,
 }
@@ -618,6 +696,10 @@ struct AgentSpec {
     model: String,
     thinking: String,
     system_prompt: String,
+    /// G.1 kind discriminator: "audit" (default) or "coder". A group may have
+    /// at most one "coder". GUI sends "coder" when the Coder toggle is on.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -823,6 +905,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         workspace: spec.workspace.clone(),
         producer_agent_id: qualified_producer_id.clone(),
         specialists: specialist_ids.clone(),
+        coder_agent_id: None,   // G.1 — Coder is added later via the toggle in Edit Group
         created_at: now.clone(),
         last_used_at: now,
     };
@@ -1103,7 +1186,27 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
 /// existing workspace, dotted-id rename, systemPromptOverride wire-up, auth
 /// mirror, team-prompt file, append to group's specialists, restart gateway.
 #[tauri::command]
-async fn groups_add_specialist(group_id: String, spec: AgentSpec) -> Result<Group, String> {
+async fn groups_add_specialist(group_id: String, mut spec: AgentSpec) -> Result<Group, String> {
+    // 0. G.1 — Coder kind branch. Apply defense-in-depth mutations BEFORE
+    //    the generic validation so a sloppy caller still ends up with a
+    //    well-formed Coder agent.
+    let is_coder = spec.kind.as_deref() == Some("coder");
+    if is_coder {
+        spec.id = "coder".to_string();
+        if !spec.model.starts_with("anthropic/claude-opus") {
+            spec.model = "anthropic/claude-opus-4-7".to_string();
+        }
+        // Coder prompts must be Producer-drafted (longer + more safety
+        // scaffolding than audit prompts). Reject empties.
+        if spec.system_prompt.trim().len() < 200 {
+            return Err(format!(
+                "Coder system prompt is too short ({} chars; need ≥200). Click \
+                 'Generate Coder prompt' first.",
+                spec.system_prompt.len()
+            ));
+        }
+    }
+
     // 1. Validate
     if spec.id.is_empty() || spec.id.len() > 20
         || !spec.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
@@ -1111,6 +1214,11 @@ async fn groups_add_specialist(group_id: String, spec: AgentSpec) -> Result<Grou
     }
     if spec.id == "producer" {
         return Err("'producer' is reserved — every group has exactly one Producer".into());
+    }
+    // 'coder' is reserved for the Coder slot. The Coder branch sets id=coder
+    // explicitly above; audit specialists can't squat on it.
+    if !is_coder && spec.id == "coder" {
+        return Err("'coder' is reserved for Coder agents — tick the 'Coder agent' toggle to create one".into());
     }
     if spec.system_prompt.trim().len() < 50 {
         return Err(format!("system prompt is too short ({} chars; need ≥50)", spec.system_prompt.len()));
@@ -1124,6 +1232,14 @@ async fn groups_add_specialist(group_id: String, spec: AgentSpec) -> Result<Grou
     let qualified_id = format!("{}.{}", group.id, spec.id);
     if group.specialists.iter().any(|s| s == &qualified_id) {
         return Err(format!("specialist '{}' already exists in group '{}'", spec.id, group.id));
+    }
+    // G.1 — at most one Coder per group
+    if is_coder && group.coder_agent_id.is_some() {
+        return Err(format!(
+            "group '{}' already has a Coder agent ({}). Remove it before adding another.",
+            group.id,
+            group.coder_agent_id.as_deref().unwrap_or("?")
+        ));
     }
 
     // 2. Workspace safety: refuse if the group's workspace dir is gone — we
@@ -1211,6 +1327,10 @@ async fn groups_add_specialist(group_id: String, spec: AgentSpec) -> Result<Grou
 
     // 5. Append to group's specialists + update thinking
     file.groups[idx].specialists.push(qualified_id.clone());
+    // G.1: also stamp the sidecar pointer for Coder agents
+    if is_coder {
+        file.groups[idx].coder_agent_id = Some(qualified_id.clone());
+    }
     write_groups_file(&file)?;
 
     if !spec.thinking.is_empty() && spec.thinking != "off" {
@@ -1245,6 +1365,10 @@ async fn groups_rename_specialist(
     }
     if new_role == "producer" {
         return Err("'producer' is reserved".into());
+    }
+    // G.1: the Coder role id is fixed (the orchestrator + GUI both key off it).
+    if new_role == "coder" || old_role == "coder" {
+        return Err("the Coder role id is fixed and cannot be renamed".into());
     }
     if new_role == old_role {
         return Err("new id is the same as old".into());
@@ -1433,6 +1557,198 @@ Return ONLY the system prompt text — no preamble, no explanation, no markdown 
     Ok(reply.trim().to_string())
 }
 
+// G.2 — workspace cleanliness probe -------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCleanReport {
+    clean: bool,
+    is_git_repo: bool,
+    /// Up to 10 entries (one per line of `git status --porcelain`).
+    dirty_paths: Vec<String>,
+    /// Total dirty entry count (may be > dirty_paths.len() when truncated).
+    dirty_count: usize,
+}
+
+/// Check whether the given group's workspace is in a clean git state. Used by
+/// the "Use Coder" guard before the orchestrator writes any files. We use
+/// `git status --porcelain` (includes untracked) because the operator's intent
+/// is "the tree must be in a known, recoverable state before Coder runs."
+///
+/// Non-git workspaces return `clean: true, is_git_repo: false` — the GUI shows
+/// a one-time confirm that warns there's no `git restore` safety net.
+#[tauri::command]
+async fn chat_check_workspace_clean(group_id: String) -> Result<WorkspaceCleanReport, String> {
+    let file = read_groups_file()?;
+    let group = file.groups.iter().find(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?;
+    let ws = group.workspace.clone();
+    if !std::path::PathBuf::from(&ws).is_dir() {
+        return Err(format!("workspace not found: {ws}"));
+    }
+
+    // Probe whether it's a git work tree at all
+    let is_repo = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "rev-parse", "--is-inside-work-tree"])
+            .output(),
+    ).await {
+        Ok(Ok(o)) => o.status.success() &&
+            String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    };
+
+    if !is_repo {
+        return Ok(WorkspaceCleanReport {
+            clean: true,
+            is_git_repo: false,
+            dirty_paths: vec![],
+            dirty_count: 0,
+        });
+    }
+
+    // git status --porcelain — empty stdout = clean
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "status", "--porcelain"])
+            .output(),
+    ).await
+        .map_err(|_| "git status timed out after 5s".to_string())?
+        .map_err(|e| format!("git status failed to spawn: {e}"))?;
+
+    if !status.status.success() {
+        return Err(format!(
+            "git status returned non-zero: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&status.stdout).to_string();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+    let sample: Vec<String> = lines.iter().take(10).map(|s| s.to_string()).collect();
+
+    Ok(WorkspaceCleanReport {
+        clean: total == 0,
+        is_git_repo: true,
+        dirty_paths: sample,
+        dirty_count: total,
+    })
+}
+
+// G.1 — Producer drafts the Coder agent's system prompt ----------------------
+
+/// Sister to groups_generate_specialist_prompt, but with a Coder-specific
+/// meta-prompt that emphasizes operational safety + tool guardrails over the
+/// audit-style "voice + owned domain" framing. The Producer's draft is what
+/// gets saved as the Coder's systemPromptOverride.
+#[tauri::command]
+async fn groups_generate_coder_prompt(group_id: String, brief: String) -> Result<String, String> {
+    if brief.trim().is_empty() {
+        return Err("brief required — describe what scope/style this Coder should follow".into());
+    }
+    let file = read_groups_file()?;
+    let group = file.groups.iter().find(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?
+        .clone();
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let prompts_dir = std::path::PathBuf::from(&home).join(".openclaw").join("team-prompts");
+
+    // Existing audit specialists (so the Coder knows whose findings it'll receive)
+    let mut existing = String::new();
+    for s in &group.specialists {
+        let role_name = s.strip_prefix(&format!("{}.", group.id)).unwrap_or(s);
+        if role_name == "coder" { continue; } // skip self
+        let path = prompts_dir.join(format!("{}.{}.md", group.id, role_name));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let snippet: String = text.chars().take(1200).collect();
+            existing.push_str(&format!("=== existing audit specialist: {role_name} ===\n{snippet}\n\n"));
+            if existing.len() > 6000 { break; }
+        }
+    }
+    if existing.is_empty() {
+        existing = "(no audit specialists in this group yet — Coder will receive whatever Producer integrates)".to_string();
+    }
+
+    let meta = format!(
+"You are the Producer for the '{display}' agent team. Dan is adding a Coder
+agent that will receive integrated audit reports from your specialists and
+make code changes in the workspace.
+
+WORKSPACE
+─────────
+{workspace}
+
+EXISTING AUDIT SPECIALISTS (whose findings Coder will act on, for tone reference)
+{existing}
+
+OPERATOR'S BRIEF
+{brief}
+
+TASK
+────
+Write the complete system prompt for this Coder agent. It MUST:
+  - Open with `# Coder — {display}`
+  - Identity paragraph: a careful implementer, NOT an investigator or planner.
+    Turns audit findings into code changes one file at a time.
+  - Inputs section: the Coder will receive (a) the original user task and
+    (b) an INTEGRATED AUDIT REPORT from Producer summarising specialist findings.
+  - Outputs section: for every file it touches, show a unified diff or a
+    before/after block BEFORE writing. End with a touched-files summary listing
+    each path + 1-line rationale per touch.
+  - Tools section. The Coder has Edit, Write, Read, and Bash via OpenClaw's
+    'full' tools profile. List what it MUST do:
+      • Read each file before editing it.
+      • Make minimum-scope changes that address cited findings only.
+      • Run `git diff --stat` after writing to self-check footprint.
+      • Use only read-only Bash (`ls`, `grep`, `cat`, `git diff/log/show`).
+    And what it MUST NEVER do:
+      • Invent files or paths not referenced by the audit or task.
+      • Create scaffolding files: BOOTSTRAP.md, IDENTITY.md, SOUL.md, USER.md,
+        AGENTS.md, HEARTBEAT.md, TOOLS.md, .openclaw/.
+      • Run state-changing git: `git add`, `git commit`, `git push`,
+        `git reset`, `git checkout`, `git stash`.
+      • Run package installers: `npm install`, `pip install`, `cargo install`.
+      • Run destructive shell: `rm -rf`, `mv` outside workspace, `chmod -R`.
+      • Touch files outside {workspace}.
+      • Resolve disagreements between specialists by picking one — flag the
+        conflict back instead.
+  - Re-audit awareness: it will sometimes be called a SECOND time (loop
+    iteration) with a re-audit critiquing its own prior work. State explicitly
+    that it must NOT defend prior choices — accept the new findings and make
+    incremental changes.
+  - Voice: concise, no apologies, no emoji, lead with the result.
+  - Length: 2500-4000 chars.
+
+OUTPUT
+──────
+Return ONLY the system prompt text — no preamble, no explanation, no markdown
+fence, no quotes around the whole thing. Start directly with `# Coder — {display}`.",
+        display = group.display_name,
+        workspace = group.workspace,
+        existing = existing,
+        brief = brief,
+    );
+
+    let meta = if meta.len() > 22000 {
+        format!("{}\n[…truncated at 22000 chars to fit argv…]", &meta[..22000])
+    } else {
+        meta
+    };
+
+    let reply = run_openclaw(&[
+        "agent",
+        "--agent", &group.producer_agent_id,
+        "--message", &meta,
+    ], None).await
+        .map_err(|e| format!("Producer call failed: {e}"))?;
+
+    Ok(reply.trim().to_string())
+}
+
 /// Ask the ACTIVE group's Producer to polish a fuzzy user brief into a full
 /// task prompt suitable for the chat box. Sister to
 /// groups_generate_specialist_prompt but aimed at the main task input — turns
@@ -1513,12 +1829,18 @@ async fn groups_remove_specialist(group_id: String, role: String) -> Result<Grou
         .ok_or_else(|| format!("group '{group_id}' not found"))?;
     let group = file.groups[idx].clone();
 
-    if group.specialists.len() <= 1 {
-        return Err("cannot remove the last specialist — a group needs at least one".into());
-    }
     let qualified_id = format!("{}.{}", group.id, role);
     if !group.specialists.iter().any(|s| s == &qualified_id) {
         return Err(format!("specialist '{}' is not in group '{}'", role, group.id));
+    }
+    // G.1: "last specialist" check counts AUDIT specialists only — the Coder
+    // doesn't count toward the minimum, and removing the Coder is always OK.
+    let is_coder = group.coder_agent_id.as_deref() == Some(&qualified_id);
+    let audit_count = group.specialists.iter()
+        .filter(|s| Some(s.as_str()) != group.coder_agent_id.as_deref())
+        .count();
+    if !is_coder && audit_count <= 1 {
+        return Err("cannot remove the last audit specialist — a group needs at least one".into());
     }
 
     let dashed_id = qualified_id.replacen('.', "-", 1);
@@ -1555,6 +1877,10 @@ async fn groups_remove_specialist(group_id: String, role: String) -> Result<Grou
 
     // 4. Drop from group's specialists + clear per-group thinking entry
     file.groups[idx].specialists.retain(|s| s != &qualified_id);
+    // G.1: clear the sidecar if we just removed the Coder
+    if is_coder {
+        file.groups[idx].coder_agent_id = None;
+    }
     write_groups_file(&file)?;
 
     let mut ct = read_crime_team_json();
@@ -2039,6 +2365,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_task,
             cancel_run,
+            cancel_run_soft,
             list_runs,
             get_run,
             orchestrator_path,
@@ -2066,6 +2393,8 @@ pub fn run() {
             groups_remove_specialist,
             groups_rename_specialist,
             groups_generate_specialist_prompt,
+            groups_generate_coder_prompt,
+            chat_check_workspace_clean,
             chat_generate_task_prompt,
         ])
         .run(tauri::generate_context!())

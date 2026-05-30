@@ -319,8 +319,35 @@ button.gear { /* fallback: if there's no inner span, just don't rotate */ }
   font-size: 13px;
 }
 /* Action cell with multiple buttons (Rename + Remove) */
-.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
 .row-actions button { white-space: nowrap; }
+
+/* G.1 — Coder agent kind toggle (top of Add Specialist form) */
+.kind-toggle {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px; border-radius: 5px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.kind-toggle input[type="checkbox"] { margin-top: 3px; }
+.kind-toggle:has(input:checked) {
+  background: #1a2a1d; border-color: #3a7a4a;
+}
+.kind-toggle.disabled { opacity: 0.6; cursor: not-allowed; }
+.kind-toggle code {
+  background: var(--panel); padding: 1px 5px; border-radius: 3px;
+  font-family: var(--mono); font-size: 11px;
+}
+
+/* G.1 — Coder chip on the agents table */
+.role-chip {
+  display: inline-block; padding: 1px 7px; border-radius: 9px;
+  font-size: 10.5px; font-weight: 600; vertical-align: middle;
+  margin-left: 6px;
+}
+.role-chip.coder-chip {
+  background: #3a3a1e; color: #d6c860; border: 1px solid #6b6224;
+}
 
 /* Wizard modal */
 .modal-wizard {
@@ -550,6 +577,21 @@ textarea#taskInput:focus { border-color: var(--accent); }
 }
 .check { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .check input { accent-color: var(--accent); }
+/* G.2/G.3 — Use Coder + Loop wrap; hidden until applicable */
+.coder-check:has(input:checked), .loop-check:has(input:checked) {
+  color: var(--text);
+}
+.loop-count {
+  width: 48px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+  margin-left: 4px;
+  font-size: 12px;
+}
+.loop-count:disabled { opacity: 0.4; cursor: not-allowed; }
 .timeout { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .timeout input {
   width: 88px;

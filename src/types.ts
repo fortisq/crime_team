@@ -12,6 +12,14 @@ export interface Group {
   workspace: string;          // absolute path
   producerAgentId: string;    // fully-qualified, e.g. "crimeos.producer"
   specialists: string[];      // fully-qualified ids, e.g. ["crimeos.architect", …]
+  /**
+   * Fully-qualified id of the optional Coder agent (e.g. "myproject.coder").
+   * The Coder is ALSO present in `specialists[]` (it's a real OpenClaw agent
+   * like any other). This sidecar flags it so the orchestrator can exclude it
+   * from the audit fan-out and the GUI can render it distinctly. At most one
+   * Coder per group. Undefined on pre-G.1 groups.
+   */
+  coderAgentId?: string;
   createdAt: string;
   lastUsedAt: string;
 }
@@ -65,4 +73,29 @@ export interface RunRecord {
   specialistResults?: { agent: string; reply: string; ok: boolean }[];
   finalAnswer?: string;
   endedAt?: string;
+
+  // --- G.2 / G.3 (all optional, additive) ---
+  /** True when the user ticked "Use Coder" for this run. */
+  usedCoder?: boolean;
+  /** Max iterations requested for the loop (1 = no loop, 2..5 = loop wrapper). */
+  loopMax?: number;
+  /** Result of iteration 1's Coder pass (Phase 5 of the initial audit). */
+  coderResult?: { ok: boolean; reply: string; durationMs: number };
+  /** Loop iterations 2..N. Iteration 1 lives in the top-level fields above. */
+  loopIterations?: Array<{
+    iteration: number;
+    audit: {
+      producerPlan?: string;
+      dispatches?: DispatchBlock[];
+      specialistResults?: { agent: string; reply: string; ok: boolean }[];
+      integrated?: string;
+      noFindings?: boolean;
+    };
+    coder?: { ok: boolean; reply: string; durationMs: number };
+  }>;
+  /** True when the loop stopped because an audit returned the AUDIT CLEAN sentinel. */
+  loopStoppedClean?: boolean;
+  /** True when the user pressed Cancel mid-loop and the orchestrator exited
+   *  cleanly between iterations via the soft-cancel marker file. */
+  loopSoftCancelled?: boolean;
 }

@@ -9,6 +9,7 @@
       "sandbox-dsl": "high"
     },
     "crime-team-orchestra": {
+      "coder": "max",
       "producer": "max",
       "qa": "low",
       "ui-ux": "medium"
