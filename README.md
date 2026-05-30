@@ -7,8 +7,8 @@ You type one task. Producer plans. Specialists run in **parallel**. Producer int
 Replaces the older PowerShell wrapper at `~/.openclaw/bin/crime-team.ps1` with a TypeScript service that:
 - Uses Node's `child_process.spawn` (better argv handling than PowerShell + cmd)
 - Runs specialists concurrently (`Promise.all` with bounded `maxParallel`)
-- Honors per-agent timeouts (Opus surveys get 15 min, QA gets 10)
-- Persists every run to `runs/<runId>.json` for review or future resume
+- Honors per-agent timeouts (defaults: 30 min for architect/frontend/security, 20 min for qa/art-director/producer; 30 min fallback)
+- Persists every run to `runs/<group-id>/<runId>.json` for review or future resume
 - Auto-truncates oversize messages with a marker (instead of crashing)
 
 ## Install
@@ -31,7 +31,7 @@ crime-team "Survey the existing admin code in myproject — list every reducer, 
 # verbose: print specialist replies as they land
 crime-team "..." --verbose
 
-# override timeout (default 15 min for Opus agents)
+# override timeout (default 30 min per call; per-role defaults in src/config.ts)
 crime-team "..." --timeout 1800
 
 # help
@@ -67,29 +67,35 @@ PRODUCER'S INTEGRATED ANSWER
 
 ## Config
 
-Drop a `.crime-team.json` in your CWD to override per-agent timeouts and parallelism:
+Drop a `.crime-team.json` in your CWD to set per-group thinking levels (and, optionally, override timeouts/parallelism). The active producer and roster come from `~/.crime-team/groups.json`, **not** this file — a `producerAgent` key here is ignored:
 
 ```json
 {
-  "producerAgent": "producer",
-  "defaultTimeoutSec": 900,
-  "maxParallel": 3,
+  "perGroupThinking": {
+    "crimeos": {
+      "producer": "high",
+      "architect": "high",
+      "frontend": "medium",
+      "art-director": "low",
+      "qa": "medium",
+      "security": "max"
+    }
+  },
+  "maxParallel": 5,
   "perAgent": {
-    "architect":   { "timeoutSec": 1800 },
-    "frontend":    { "timeoutSec": 1200 },
-    "art-director":{ "timeoutSec": 600  },
-    "qa":          { "timeoutSec": 600  },
-    "producer":    { "timeoutSec": 900  }
+    "architect": { "timeoutSec": 1800 }
   }
 }
 ```
+
+`perGroupThinking[<group-id>][<role>]` sets each agent's `--thinking` level (the only thinking config the orchestrator reads). `perAgent`, `defaultTimeoutSec`, and `maxParallel` are optional overrides — omit them for the built-in defaults.
 
 `maxParallel` caps how many specialists run at once. Useful if your Max-sub usage window can't sustain N concurrent Opus calls.
 
 ## Requires
 
 - Node.js 18+ (you have 22+)
-- OpenClaw installed with the 5-agent team (producer / architect / frontend / art-director / qa) configured. See `~\.openclaw\team-prompts\HOW-TO.md`.
+- OpenClaw installed with the active group's team configured. The dispatched roster is whatever is in that group's `specialists[]` in `~/.crime-team/groups.json` and **varies per project** (Crime OS ships 5 — architect / frontend / art-director / qa / security — plus the producer). The 6 names in `src/config.ts` `DEFAULT_PER_AGENT` are **timeout fallbacks only**, not the dispatch list — editing them does not change who runs. See `~\.openclaw\team-prompts\HOW-TO.md`.
 - `openclaw.cmd` discoverable on PATH (default install puts it at `%APPDATA%\npm\openclaw.cmd`). Override with `OPENCLAW_BIN=...` env var.
 
 ## Desktop GUI
@@ -113,7 +119,7 @@ cargo tauri build                        # ~5-10 min, optimized + bundled
 ```
 
 What the GUI gives you over the CLI:
-- Persistent **run history sidebar** (loads `runs/*.json` automatically)
+- Persistent **run history sidebar** (loads the active group's `runs/<group-id>/*.json` automatically)
 - **Live per-agent status cards** (spinner per running specialist, ok/fail when done)
 - **Live log panel** with colorized info/phase/ok/warn/error
 - **Integrated answer block** at the bottom with a copy button
@@ -124,9 +130,32 @@ The GUI launches `node bin/crime-team.mjs` under the hood — same orchestrator,
 ## What it doesn't do (yet)
 
 - **No streaming**: you wait for each agent's full reply, no token-by-token.
-- **No `--resume`**: stub exists but not implemented. Plan: load `runs/<id>.json`, skip phases that succeeded, re-run from first failure.
+- **`--resume` does not work as described**: the flag *is* wired, but it reuses the given runId, **overwrites** the existing `runs/<group-id>/<runId>.json`, and re-runs every phase from scratch — it does **not** load prior results or skip succeeded phases. Treat it as "re-run under this id," not resume. (The intended behavior — load `runs/<id>.json`, skip succeeded phases, re-run from first failure — is still unimplemented.)
 - **No tool-approval gating**: agents act freely within their permitted tool profile. If you need confirm-before-write, that's a v0.2 feature.
 - **No web UI**: terminal only.
+
+## Run artifacts & protocols
+
+Behaviors the orchestrator enforces that aren't visible from the CLI flags — these bite if you don't know them.
+
+- **Run records live under `runs/<group-id>/<runId>.json`** — not `runs/<runId>.json`. Every run is scoped to the active group (`config.ts` → `runsDir: runs/<group-id>`). The #1 "why isn't my run showing?" cause is looking in the wrong group's subfolder.
+- **Soft-cancel via a `.cancel` marker.** The GUI's Cancel (command `cancel_run_soft`) writes `runs/<group-id>/<runId>.cancel`. The orchestrator polls for it between loop iterations and before the Coder phase, then exits cleanly instead of hard-killing. CLI users can stop a `--loop` run cleanly by creating that file by hand; the orchestrator deletes it on the way out. (`src/orchestrator.ts`.)
+- **`.salvage/` directories are recovery dumps.** A `runs/<group-id>/<runId>.salvage/` folder holds loose-file copies of one run — `00-task.md` (the task) plus one `ok-<agent>.md` per successful specialist reply. The authoritative record is still the sibling `<runId>.json`, which already contains the task and every reply; the `.salvage/` dump is derived and safe to delete (you only lose the loose copies). To actually re-integrate a run that died mid-integration (e.g. a Defender/EPERM block in Phase 3), run `node scripts/salvage-integrate.mjs <runId>` — note it reads the **`.json` record**, *not* the `.salvage/` dir, and writes `finalAnswer` back.
+- **Dispatch is an enforced wire protocol.** Producer requests specialists by emitting blocks in this exact grammar:
+
+  ```
+  DISPATCH: <agent-id>
+  TASK: <one-line summary>
+  CONTEXT: <files/sections to read>
+  DELIVERABLE: <what they produce>
+  ```
+
+  Blocks are separated by a blank line or the next `DISPATCH:`. Markdown-bolded labels (`**DISPATCH:**`) are tolerated (pre-stripped), but any other deviation parses as **zero** dispatches and silently triggers the auto-fan-out path — every specialist runs, which is expensive. (`src/dispatch.ts`.)
+- **Keyword heuristics silently widen dispatch.** With Smart Dispatch OFF, phrases like "every / all / each specialist" in the task (or a preset's wording) flip the run into full-roster enforcement: the orchestrator auto-adds any specialist the Producer omitted. The trigger is the task's wording, and the substitution shows up only as a `warn` log line — invisible in the run record's plan. (`src/orchestrator.ts`.)
+- **`thinking: "max"` clamps to `"high"` on non-Opus models.** `max` is Anthropic-Opus-only; on any other model the orchestrator downgrades to `high` to avoid a silent claude-cli hang. The warning is written to **stderr only** — the GUI never surfaces it, so a Sonnet/Gemini agent you set to `max` is really running `high`. (`src/agent.ts`.)
+- **Timed-out calls retry once at 1.5× the timeout.** A specialist that times out is retried a single time with `Math.round(timeout * 1.5)`. Budget for it when tuning `--timeout`. (`src/orchestrator.ts`.)
+- **`--group <id>` is a hint, not a switch.** The CLI validates the id and prints a note, but the run always uses `activeGroupId` from `~/.crime-team/groups.json`. To actually change groups, set the active group in the GUI (or edit `groups.json`). (`src/cli.ts`.)
+- **The Coder is excluded from the audit fan-out.** A group's optional `coderAgentId` stays in `specialists[]` but `auditSpecialists()` filters it out of Phases 1–4; it runs only in the Coder phase under `--use-coder`. (`src/config.ts`.)
 
 ## Architecture decisions (the why)
 
