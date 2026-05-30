@@ -688,8 +688,9 @@ const THINKING_LABEL = { "": "(default)", "": "(default)" };
 
 function thinkingLevelsFor(modelId) {
   const m = (modelId || "").toLowerCase();
-  const FULL = ["", "off", "low", "medium", "high", "max"];
-  const NONE = ["", "off"];
+  const FULL_WITH_MAX = ["", "off", "low", "medium", "high", "max"];
+  const FULL          = ["", "off", "low", "medium", "high"];
+  const NONE          = ["", "off"];
 
   // Inclusion-by-default. Only exclude models we KNOW don't support extended
   // thinking. If a model ignores the parameter, the worst case is "high" gets
@@ -711,6 +712,12 @@ function thinkingLevelsFor(modelId) {
   // OpenRouter wrappers around the above
   if (/^openrouter\/(google\/gemma|meta-llama\/llama-?\d|qwen\/qwen3-coder|cognitivecomputations\/dolphin|liquid\/lfm|nvidia\/nemotron-nano)/.test(m)) return NONE;
 
+  // 'max' thinking is Anthropic-Opus-only. Sonnet rejects it via claude-cli
+  // with an empty-stderr silent failure (caught after a 33s ui-ux dispatch
+  // returned with no useful error). Other Anthropic models stay at 'high'.
+  if (m.startsWith("anthropic/claude-opus") || m === "anthropic/claude-opus-4-7" || m === "anthropic/claude-opus-4-6") {
+    return FULL_WITH_MAX;
+  }
   return FULL;
 }
 

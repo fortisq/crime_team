@@ -11,7 +11,7 @@
     "crime-team-orchestra": {
       "producer": "max",
       "qa": "low",
-      "ui-ux": "max"
+      "ui-ux": "medium"
     },
     "crimeos": {
       "architect": "high",
