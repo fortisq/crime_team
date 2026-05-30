@@ -482,21 +482,43 @@ RULES\n─────\n- DO NOT include Producer; that role is fixed.\n- DO NOT
 
     emit_scan(&app, "calling-model", format!("calling {} ({} chars prompt)…", model, prompt.len()));
 
-    // ─── 3. call the model via openclaw infer ───────────────────────────────
-    // openclaw infer model run --local --model X --prompt Y. argv-limited.
-    // We cap to ~24KB total prompt to leave room for other args.
+    // ─── 3. call the model ───────────────────────────────────────────────────
+    // Cap the prompt at ~24KB so argv fits on Windows.
     if prompt.len() > 24000 {
         prompt.truncate(24000);
         prompt.push_str("\n[…prompt truncated by scan at 24000 chars to fit argv…]");
     }
 
-    let mut args: Vec<&str> = vec!["infer", "model", "run", "--local", "--model", &model, "--prompt", &prompt];
-    if !thinking.is_empty() && thinking != "off" {
-        args.push("--thinking");
-        args.push(&thinking);
-    }
-    let raw = run_openclaw(&args, None).await
-        .map_err(|e| format!("model call failed: {e}"))?;
+    // Precedence: "explicit key wins, CLI is fallback".
+    // If the user has typed an Anthropic API key (saved in auth-profiles.json
+    // or exported as ANTHROPIC_API_KEY), respect that — they made an explicit
+    // choice to use the HTTP API. Otherwise route through `openclaw agent
+    // --agent main` so the runtime defaults map picks claude-cli and uses
+    // the Max sub. The user's instinct was right: implicit overrides confuse.
+    let is_anthropic = model.starts_with("anthropic/");
+    let has_anthropic_key = is_anthropic && has_provider_auth("anthropic");
+    let raw = if is_anthropic && !has_anthropic_key {
+        let mut args: Vec<&str> = vec![
+            "agent",
+            "--agent", "main",
+            "--model", &model,
+            "--message", &prompt,
+        ];
+        if !thinking.is_empty() && thinking != "off" {
+            args.push("--thinking");
+            args.push(&thinking);
+        }
+        run_openclaw(&args, None).await
+            .map_err(|e| format!("model call failed (via claude-cli runtime): {e}"))?
+    } else {
+        let mut args: Vec<&str> = vec!["infer", "model", "run", "--local", "--model", &model, "--prompt", &prompt];
+        if !thinking.is_empty() && thinking != "off" {
+            args.push("--thinking");
+            args.push(&thinking);
+        }
+        run_openclaw(&args, None).await
+            .map_err(|e| format!("model call failed: {e}"))?
+    };
 
     emit_scan(&app, "parsing", "parsing team proposal…");
 
@@ -1356,6 +1378,94 @@ async fn settings_remove_provider(profile_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Does the user have any kind of auth wired for the given provider? Used by
+/// the scan wizard to decide "explicit key wins, CLI fallback otherwise" for
+/// Anthropic. Checks both the saved auth-profiles store and an env var.
+fn has_provider_auth(provider: &str) -> bool {
+    // 1. Env var (e.g. ANTHROPIC_API_KEY) — the standard SDK escape hatch
+    let env_key = format!("{}_API_KEY", provider.to_uppercase());
+    if std::env::var(&env_key).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return true;
+    }
+    // 2. Saved profile in ~/.openclaw/agents/main/agent/auth-profiles.json
+    let Ok(home) = std::env::var("USERPROFILE") else { return false; };
+    let path = std::path::PathBuf::from(home)
+        .join(".openclaw").join("agents").join("main").join("agent").join("auth-profiles.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return false; };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { return false; };
+    let Some(profiles) = json.get("profiles").and_then(|v| v.as_object()) else { return false; };
+    profiles.values().any(|p| {
+        p.get("provider").and_then(|x| x.as_str()) == Some(provider)
+            && p.get("key").and_then(|x| x.as_str()).map(|k| !k.trim().is_empty()).unwrap_or(false)
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCliStatus {
+    installed: bool,
+    version: Option<String>,
+    path: Option<String>,
+}
+
+/// Detect whether the Claude Code CLI is installed, and what version.
+///
+/// npm's Windows global install drops a `claude.cmd` shim into `%APPDATA%\npm`
+/// and the real `claude.exe` at
+/// `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`. Only
+/// the `.cmd` is on PATH at the top level, so `where claude.exe` returns
+/// nothing — which is why the previous "is it installed?" check kept saying
+/// "not installed" on machines that obviously had it. We probe the .cmd / .bat
+/// / extensionless shim first, then fall back to the canonical npm path.
+#[tauri::command]
+async fn settings_claude_cli_status() -> Result<ClaudeCliStatus, String> {
+    // Try several extension variants. Windows `where` is strict — `claude` and
+    // `claude.cmd` are different lookups.
+    let mut found: Option<String> = None;
+    for name in ["claude.cmd", "claude.exe", "claude.bat", "claude"] {
+        let out = tokio::process::Command::new("where").arg(name).output().await;
+        if let Ok(o) = out {
+            if o.status.success() {
+                if let Some(p) = String::from_utf8_lossy(&o.stdout).lines().next() {
+                    let trimmed = p.trim();
+                    if !trimmed.is_empty() {
+                        found = Some(trimmed.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Final fallback: probe npm's canonical install path directly. Works even
+    // if PATH doesn't include `%APPDATA%\npm` (some launchers strip it).
+    if found.is_none() {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = std::path::PathBuf::from(appdata)
+                .join("npm").join("node_modules").join("@anthropic-ai")
+                .join("claude-code").join("bin").join("claude.exe");
+            if p.exists() {
+                found = Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    let Some(claude_path) = found else {
+        return Ok(ClaudeCliStatus { installed: false, version: None, path: None });
+    };
+    // Probe --version. Tolerate a slow/missing reply — install state is the
+    // primary signal; version is decorative.
+    let v_out = tokio::process::Command::new(&claude_path)
+        .arg("--version")
+        .output().await;
+    let version = match v_out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
+    };
+    Ok(ClaudeCliStatus { installed: true, version, path: Some(claude_path) })
+}
+
 /// Try a 1-token inference against the named provider's representative model.
 /// Returns the model's reply on success; returns a stripped error on failure.
 #[tauri::command]
@@ -1415,6 +1525,7 @@ pub fn run() {
             settings_restart_gateway,
             settings_remove_provider,
             settings_test_provider,
+            settings_claude_cli_status,
             settings_set_agent_thinking,
             groups_list,
             groups_get_active,

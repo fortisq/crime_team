@@ -1,5 +1,13 @@
 {
   "perGroupThinking": {
+    "myproject": {
+      "cyberspace-3d": "medium",
+      "game-engine": "high",
+      "os-frontend": "medium",
+      "platform-auth": "high",
+      "producer": "max",
+      "sandbox-dsl": "high"
+    },
     "crime-team-orchestra": {
       "backend": "low",
       "desktop": "low",
@@ -12,6 +20,14 @@
       "producer": "high",
       "qa": "medium",
       "security": "max"
+    },
+    "servuo": {
+      "build-ops": "medium",
+      "content-dev": "medium",
+      "crash-doctor": "high",
+      "producer": "max",
+      "server-core": "high",
+      "world-data": "medium"
     }
   }
 }

@@ -145,6 +145,13 @@ button.gear { /* fallback: if there's no inner span, just don't rotate */ }
   z-index: 1000;
 }
 .modal-backdrop.hidden { display: none; }
+
+/* Generic visibility helper. The element-scoped `.hidden` rules below
+   (.wizard-step.hidden, .wizard-progress.hidden, .status.hidden) were the only
+   way `.hidden` did anything — so adding it to any other element (e.g.
+   #wzProposal) silently did nothing. This catchall makes JS-toggled .hidden
+   work on any element, regardless of its base display. */
+.hidden { display: none !important; }
 .modal {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -176,6 +183,12 @@ button.gear { /* fallback: if there's no inner span, just don't rotate */ }
 .settings-section h3 { font-size: 14px; margin: 0 0 6px; font-weight: 600; letter-spacing: 0.02em; }
 .settings-section p { margin: 0 0 10px; }
 .settings-section code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-family: var(--mono); font-size: 11.5px; }
+
+.cli-status { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; background: var(--panel-2); border-radius: 4px; font-size: 12px; }
+.cli-status .cli-status-label { font-weight: 600; color: var(--text); }
+.cli-status .ok   { color: var(--ok); font-weight: 600; }
+.cli-status .warn { color: var(--warn, #fbbf24); font-weight: 600; }
+.cli-status code  { background: var(--panel); padding: 0 4px; border-radius: 3px; }
 
 .settings-table {
   width: 100%;

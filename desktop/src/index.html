@@ -114,6 +114,14 @@
           <section class="settings-section">
             <h3>Providers</h3>
             <p class="muted">API keys are stored in <code>~/.openclaw/agents/main/agent/auth-profiles.json</code>.</p>
+            <div id="claudeCliStatusRow" class="cli-status muted">
+              <span class="cli-status-label">Claude CLI:</span>
+              <span class="cli-status-detail">checking…</span>
+            </div>
+            <p class="muted" style="margin-top:6px">
+              <em>Precedence for Anthropic: if you save an Anthropic API key below, it's used (HTTP).
+              If not, the app falls back to Claude CLI (your Max subscription).</em>
+            </p>
             <table class="settings-table" id="providersTable">
               <thead><tr><th>Profile</th><th>Provider</th><th>Type</th><th></th></tr></thead>
               <tbody></tbody>

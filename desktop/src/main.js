@@ -628,9 +628,33 @@ async function loadSettings() {
     // Per-agent model + thinking moved into the Edit Group modal — no
     // longer rendered here. (See egState / renderEgAgentsTable.)
     await renderGroupsTable();
+    await renderClaudeCliStatus();
     settingsEls.status.textContent = "";
   } catch (e) {
     settingsEls.status.textContent = `load failed: ${e}`;
+  }
+}
+
+/**
+ * Render the Claude CLI status row in Settings → Providers. Shows whether
+ * claude.exe is on PATH (the Anthropic fallback path used when no API key is
+ * saved). Non-blocking — failures degrade to an unobtrusive "unknown" state.
+ */
+async function renderClaudeCliStatus() {
+  const row = document.getElementById("claudeCliStatusRow");
+  if (!row) return;
+  const detail = row.querySelector(".cli-status-detail");
+  if (!detail) return;
+  try {
+    const s = await invoke("settings_claude_cli_status");
+    if (s.installed) {
+      const v = s.version ? ` ${s.version}` : "";
+      detail.innerHTML = `<span class="ok">✓ detected${escapeHtml(v)}</span> <span class="muted">— Anthropic fallback ready (Max sub)</span>`;
+    } else {
+      detail.innerHTML = `<span class="warn">✗ not installed</span> <span class="muted">— run <code>npm i -g @anthropic-ai/claude-code</code> to enable the Anthropic fallback</span>`;
+    }
+  } catch (e) {
+    detail.innerHTML = `<span class="muted">unknown (${escapeHtml(String(e))})</span>`;
   }
 }
 
@@ -1196,6 +1220,16 @@ function showWizard() {
   wizEls.workspace.value = "";
   fillSelect(wizEls.producerModel, allCatalogedModels(), "anthropic/claude-opus-4-7");
   fillSelect(wizEls.producerThinking, THINKING_OPTIONS, "high");
+  // Belt-and-suspenders: clear stale DOM from a previous wizard run so the
+  // first paint never shows the prior project's proposal cards or rationale.
+  // The .hidden class also covers this now, but explicit reset is cheap and
+  // prevents any future regression if a sibling toggles visibility.
+  wizEls.proposal?.classList.add("hidden");
+  wizEls.scanProgress?.classList.add("hidden");
+  if (wizEls.rationale)   wizEls.rationale.textContent = "";
+  if (wizEls.specList)    wizEls.specList.innerHTML = "";
+  if (wizEls.scanPhase)   wizEls.scanPhase.textContent = "starting…";
+  if (wizEls.scanDetail)  wizEls.scanDetail.textContent = "";
   goToStep(1);
 }
 
