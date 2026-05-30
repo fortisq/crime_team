@@ -103,6 +103,15 @@
         </header>
         <div class="modal-body">
           <section class="settings-section">
+            <h3>Groups</h3>
+            <p class="muted">Each project group is a separate agent team with its own workspace, presets, and run history.</p>
+            <table class="settings-table" id="groupsTable">
+              <thead><tr><th>Group</th><th>Workspace</th><th>Agents</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </section>
+
+          <section class="settings-section">
             <h3>Providers</h3>
             <p class="muted">API keys are stored in <code>~/.openclaw/agents/main/agent/auth-profiles.json</code>.</p>
             <table class="settings-table" id="providersTable">
@@ -139,23 +148,69 @@
             </details>
           </section>
 
-          <section class="settings-section">
-            <h3>Agents — primary model</h3>
-            <p class="muted">Each agent's <em>primary</em> model. Fallback chain is preserved automatically. Changes require a gateway restart.</p>
-            <table class="settings-table" id="agentsTable">
-              <thead><tr><th>Agent</th><th>Current</th><th>Set primary to</th><th>Thinking</th></tr></thead>
-              <tbody></tbody>
-            </table>
-            <p class="muted" style="margin-top:8px">
-              <strong>Thinking</strong> controls extended reasoning per agent — DeepSeek's thinking mode, Claude's extended thinking, OpenAI's reasoning effort. Higher = slower + more accurate on hard problems. Leave at <em>(default)</em> if unsure.
-            </p>
-          </section>
+          <!-- Agents section moved into the Edit Group modal — each group's
+               model + thinking config now lives next to its prompts. -->
+          <p class="muted" style="margin-top:-8px"><em>Per-agent model + thinking for a group are configured inside that group's Edit panel (Groups section above).</em></p>
         </div>
         <footer class="modal-footer">
           <span id="settingsStatus" class="muted"></span>
           <div class="modal-footer-actions">
             <button id="settingsCancelBtn" class="ghost">Cancel</button>
             <button id="settingsApplyBtn" class="primary">Apply</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Group editor modal -->
+    <div class="modal-backdrop hidden" id="editGroupModal">
+      <div class="modal modal-wizard">
+        <header class="modal-header">
+          <h2>Edit group <span id="egGroupTitle"></span></h2>
+          <button id="egCloseBtn" class="ghost small">✕</button>
+        </header>
+        <div class="modal-body wizard-body">
+          <section class="settings-section">
+            <h3>Metadata</h3>
+            <div class="form-grid">
+              <label class="full"><span>Display name</span>
+                <input type="text" id="egName" />
+              </label>
+              <label><span>Emoji</span>
+                <input type="text" id="egEmoji" maxlength="4" />
+              </label>
+              <label class="full"><span>Workspace directory <span class="muted">(careful — changes propagate to every agent's workspace)</span></span>
+                <div class="browse-row">
+                  <input type="text" id="egWorkspace" />
+                  <button id="egBrowseBtn" class="ghost small">Browse…</button>
+                </div>
+              </label>
+            </div>
+          </section>
+          <section class="settings-section">
+            <h3>Agents — primary model + thinking</h3>
+            <p class="muted">Each agent's primary model and thinking level for this group. Changes save when you click Save changes (gateway restart included).</p>
+            <table class="settings-table" id="egAgentsTable">
+              <thead><tr><th>Agent</th><th>Current</th><th>Set primary to</th><th>Thinking</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </section>
+
+          <section class="settings-section">
+            <h3>System prompts</h3>
+            <p class="muted">Edit any agent's system prompt. Changes save when you click Save changes; gateway restarts automatically.</p>
+            <div class="prompt-tabs" id="egPromptTabs"></div>
+            <div class="prompt-editor">
+              <textarea id="egPromptEditor" rows="20" spellcheck="false"></textarea>
+              <div class="prompt-meta muted" id="egPromptMeta"></div>
+            </div>
+          </section>
+        </div>
+        <footer class="modal-footer">
+          <span id="egStatus" class="muted"></span>
+          <div class="modal-footer-actions">
+            <button id="egCancelBtn" class="ghost">Cancel</button>
+            <button id="egSaveBtn" class="primary">Save changes</button>
           </div>
         </footer>
       </div>

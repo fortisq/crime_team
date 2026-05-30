@@ -719,18 +719,34 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         ], None).await;
     }
 
-    // ─── 3. patch agents.list to add systemPromptOverride + thinking is per-group .crime-team.json ──
-    // Re-read agents.list, find each new agent, set systemPromptOverride.
+    // ─── 3. patch agents.list ─────────────────────────────────────────────
+    //   (a) Rename: OpenClaw's `agents add` silently converts dots in agent
+    //       ids to dashes, so what we asked for as "groupslug.role" was
+    //       actually stored as "groupslug-role". Rename it back to match what
+    //       groups.json + dispatch code expect.
+    //   (b) Add systemPromptOverride per agent.
     emit_scan(&app, "creating", "wiring system prompts…");
     let list_json = run_openclaw(&["config", "get", "agents.list"], None).await
         .map_err(|e| { format!("read agents.list: {e}") })?;
     let mut list: serde_json::Value = serde_json::from_str(&list_json)
         .map_err(|e| format!("parse agents.list: {e}"))?;
+    let dashed_prefix = format!("{}-", spec.id);
+    let dotted_prefix = format!("{}.", spec.id);
     if let Some(arr) = list.as_array_mut() {
         for (agent_spec, qid, _role) in make_specs() {
+            // qid is the dotted form ("groupslug.role"). The actual id stored
+            // by `agents add` might be the dashed form. Match either.
+            let dashed_id = qid.replacen(&dotted_prefix, &dashed_prefix, 1);
             for a in arr.iter_mut() {
-                if a.get("id").and_then(|v| v.as_str()) == Some(qid.as_str()) {
+                let current_id = a.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if current_id == qid || current_id == dashed_id {
                     if let Some(obj) = a.as_object_mut() {
+                        // Force the id back to the dotted form
+                        obj.insert("id".to_string(), serde_json::Value::String(qid.clone()));
+                        if obj.contains_key("name") {
+                            obj.insert("name".to_string(), serde_json::Value::String(qid.clone()));
+                        }
+                        // Wire the prompt
                         obj.insert("systemPromptOverride".to_string(),
                                    serde_json::Value::String(agent_spec.system_prompt.clone()));
                     }
@@ -769,11 +785,11 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         return Err(format!(".crime-team.json write: {e}"));
     }
 
-    // ─── 5. write starter presets.js for this group ──────────────────────────
+    // ─── 5. write starter presets.json for this group ────────────────────────
     let group_dir = ct_root.join("groups").join(&spec.id);
     let _ = std::fs::create_dir_all(&group_dir);
-    let presets_path = group_dir.join("presets.js");
-    let starter_presets = starter_presets_for_group(&spec);
+    let presets_path = group_dir.join("presets.json");
+    let starter_presets = starter_presets_json_for_group(&spec);
     let _ = std::fs::write(&presets_path, &starter_presets);
 
     // ─── 6. append to groups.json + set active ───────────────────────────────
@@ -815,40 +831,221 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Generate a minimal starter presets.js for a new group with one universal preset.
-fn starter_presets_for_group(spec: &CreateGroupSpec) -> String {
+/// Generate a minimal starter presets.json for a new group.
+/// Structure: { "presets": [{"group", "items": [{"label", "prompt"}]}], "angles": [{"label", "suffix"}] }
+fn starter_presets_json_for_group(spec: &CreateGroupSpec) -> String {
     let specialists_csv = spec.specialists.iter()
         .map(|s| s.id.clone())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-"// Preset library for the '{}' group. Edit freely; refresh GUI to pick up changes.\n\
-// Each preset is a labelled task prompt. See ~/.crime-team/groups/<other>/presets.js\n\
-// for more examples.\n\
-\n\
-export const PRESETS = [\n\
-  {{\n\
-    group: \"Combos\",\n\
-    items: [\n\
-      {{\n\
-        label: \"Universal Findings\",\n\
-        prompt:\n\
-`Do a read-only Findings pass on this system. No code changes. Judge it from two angles:\n\
-1. Will this hurt the user experience?\n\
-2. Will this slow development later?\n\n\
-Report only the highest-value findings. Ignore minor style issues unless they create real risk. Dispatch in parallel to all relevant specialists ({}). Synthesize into ONE integrated report.`\n\
-      }},\n\
-    ],\n\
-  }},\n\
-];\n\
-\n\
-export const ANGLES = [\n\
-  {{ label: \"(no extra angle)\", suffix: \"\" }},\n\
-  {{ label: \"Prioritize user pain over coding purity\", suffix: \"\\n\\nPrioritize findings by user pain, not coding purity.\" }},\n\
-  {{ label: \"Sort into ship-blocker / soon / later\", suffix: \"\\n\\nSeparate \\\"ship blocker,\\\" \\\"soon,\\\" and \\\"later.\\\"\" }},\n\
-];\n",
-        spec.display_name, specialists_csv
-    )
+    let payload = serde_json::json!({
+        "presets": [
+            {
+                "group": "Combos",
+                "items": [
+                    {
+                        "label": "Universal Findings",
+                        "prompt": format!(
+"Do a read-only Findings pass on this system. No code changes. Judge it from two angles:\n1. Will this hurt the user experience?\n2. Will this slow development later?\n\nReport only the highest-value findings. Ignore minor style issues unless they create real risk. Dispatch in parallel to all relevant specialists ({}). Synthesize into ONE integrated report.",
+                            specialists_csv)
+                    }
+                ]
+            }
+        ],
+        "angles": [
+            { "label": "(no extra angle)", "suffix": "" },
+            { "label": "Prioritize user pain over coding purity", "suffix": "\n\nPrioritize findings by user pain, not coding purity." },
+            { "label": "Sort into ship-blocker / soon / later", "suffix": "\n\nSeparate \"ship blocker,\" \"soon,\" and \"later.\"" }
+        ]
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Read an agent's system prompt from the team-prompts dir.
+#[tauri::command]
+fn groups_get_prompt(agent_id: String) -> Result<String, String> {
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    // agent_id like "crimeos.architect" → team-prompts/crimeos.architect.md
+    let path = std::path::PathBuf::from(home).join(".openclaw").join("team-prompts").join(format!("{}.md", agent_id));
+    std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))
+}
+
+/// Write an agent's system prompt: updates the team-prompts/.md file AND
+/// patches the agent's systemPromptOverride in openclaw.json so the gateway
+/// uses the new content on next call.
+#[tauri::command]
+async fn groups_set_prompt(agent_id: String, prompt: String) -> Result<(), String> {
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let path = std::path::PathBuf::from(home).join(".openclaw").join("team-prompts").join(format!("{}.md", agent_id));
+    std::fs::write(&path, &prompt).map_err(|e| format!("write {path:?}: {e}"))?;
+
+    // Patch openclaw.json
+    let list_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
+    let mut list: serde_json::Value = serde_json::from_str(&list_json)
+        .map_err(|e| format!("parse agents.list: {e}"))?;
+    if let Some(arr) = list.as_array_mut() {
+        let mut found = false;
+        for a in arr.iter_mut() {
+            if a.get("id").and_then(|s| s.as_str()) == Some(&agent_id) {
+                if let Some(obj) = a.as_object_mut() {
+                    obj.insert("systemPromptOverride".to_string(), serde_json::Value::String(prompt.clone()));
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found { return Err(format!("agent '{agent_id}' not found in agents.list")); }
+    }
+    let payload = serde_json::json!({ "agents": { "list": list } });
+    let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    run_openclaw(&["config", "patch", "--stdin", "--replace-path", "agents.list"], Some(payload_s.as_bytes())).await?;
+    Ok(())
+}
+
+/// Edit a group's metadata. Pass null/empty to leave a field unchanged.
+/// Workspace change also rewrites the workspace of every agent in this group
+/// inside openclaw.json so they point at the new project root.
+#[tauri::command]
+async fn groups_edit(
+    group_id: String,
+    display_name: Option<String>,
+    emoji: Option<String>,
+    workspace: Option<String>,
+) -> Result<Group, String> {
+    let mut file = read_groups_file()?;
+    let updated = {
+        let g = file.groups.iter_mut().find(|g| g.id == group_id)
+            .ok_or_else(|| format!("group '{group_id}' not found"))?;
+        if let Some(n) = display_name.as_ref() { if !n.trim().is_empty() { g.display_name = n.clone(); } }
+        if let Some(e) = emoji.as_ref()        { if !e.trim().is_empty() { g.emoji = e.clone(); } }
+        if let Some(w) = workspace.as_ref()    {
+            if !w.trim().is_empty() {
+                if !std::path::PathBuf::from(w).is_dir() {
+                    return Err(format!("new workspace does not exist: {w}"));
+                }
+                g.workspace = w.clone();
+            }
+        }
+        g.last_used_at = chrono_now_iso();
+        g.clone()
+    };
+    write_groups_file(&file)?;
+
+    // If workspace changed, rewrite every agent's workspace in openclaw.json.
+    if let Some(new_ws) = workspace.as_ref() {
+        if !new_ws.trim().is_empty() {
+            let mut agent_ids: Vec<String> = updated.specialists.clone();
+            agent_ids.push(updated.producer_agent_id.clone());
+            let list_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
+            let mut list: serde_json::Value = serde_json::from_str(&list_json).map_err(|e| format!("parse agents.list: {e}"))?;
+            if let Some(arr) = list.as_array_mut() {
+                for a in arr.iter_mut() {
+                    let id = a.get("id").and_then(|s| s.as_str()).unwrap_or("");
+                    if agent_ids.iter().any(|x| x == id) {
+                        if let Some(obj) = a.as_object_mut() {
+                            obj.insert("workspace".to_string(), serde_json::Value::String(new_ws.clone()));
+                        }
+                    }
+                }
+            }
+            let payload = serde_json::json!({ "agents": { "list": list } });
+            let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+            run_openclaw(&["config", "patch", "--stdin", "--replace-path", "agents.list"], Some(payload_s.as_bytes())).await?;
+            let _ = run_openclaw(&["gateway", "restart"], None).await;
+        }
+    }
+    Ok(updated)
+}
+
+/// Remove a group: delete its agents from OpenClaw, delete agent dirs, delete
+/// team-prompts/<gid>.*.md, delete runs/<gid>/, delete ~/.crime-team/groups/<gid>/,
+/// remove from groups.json. If the active group is being removed, switch to
+/// another group (or refuse if it's the last one).
+#[tauri::command]
+async fn groups_remove(group_id: String) -> Result<(), String> {
+    let mut file = read_groups_file()?;
+    let idx = file.groups.iter().position(|g| g.id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found"))?;
+    if file.groups.len() <= 1 {
+        return Err("cannot remove the only group — create another first".into());
+    }
+    let group = file.groups[idx].clone();
+
+    // 1. delete every agent from OpenClaw
+    let mut agent_ids: Vec<String> = group.specialists.clone();
+    agent_ids.push(group.producer_agent_id.clone());
+    for id in &agent_ids {
+        let _ = run_openclaw(&["agents", "delete", id, "--yes"], None).await;
+    }
+
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let home_path = std::path::PathBuf::from(&home);
+
+    // 2. delete agent dirs (in case `agents delete` left them)
+    for id in &agent_ids {
+        let dir = home_path.join(".openclaw").join("agents").join(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 3. delete team-prompt files
+    let prompts_dir = home_path.join(".openclaw").join("team-prompts");
+    if let Ok(entries) = std::fs::read_dir(&prompts_dir) {
+        let prefix = format!("{}.", group.id);
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(".md") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    // 4. delete runs/<gid>/
+    let runs_dir = orchestrator_root().join("runs").join(&group.id);
+    let _ = std::fs::remove_dir_all(&runs_dir);
+
+    // 5. delete ~/.crime-team/groups/<gid>/
+    let cgroup_dir = home_path.join(".crime-team").join("groups").join(&group.id);
+    let _ = std::fs::remove_dir_all(&cgroup_dir);
+
+    // 6. remove per-group thinking + remove from groups.json + adjust active
+    let mut ct = read_crime_team_json();
+    if let Some(obj) = ct.as_object_mut() {
+        if let Some(map) = obj.get_mut("perGroupThinking").and_then(|m| m.as_object_mut()) {
+            map.remove(&group.id);
+        }
+    }
+    let _ = write_crime_team_json(&ct);
+
+    file.groups.remove(idx);
+    if file.active_group_id == group_id {
+        file.active_group_id = file.groups[0].id.clone();
+        file.groups[0].last_used_at = chrono_now_iso();
+    }
+    write_groups_file(&file)?;
+    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    Ok(())
+}
+
+/// Read a group's presets.json from disk. Returns None if the file doesn't
+/// exist or can't be parsed — the GUI falls back to bundled defaults.
+#[tauri::command]
+fn groups_get_presets(group_id: String) -> Option<serde_json::Value> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    let path = PathBuf::from(home).join(".crime-team").join("groups").join(&group_id).join("presets.json");
+    let txt = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+/// Write a group's presets.json. Used by the Settings → Groups editor (future)
+/// and by the migration helper below.
+#[tauri::command]
+fn groups_set_presets(group_id: String, presets: serde_json::Value) -> Result<(), String> {
+    let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
+    let dir = PathBuf::from(home).join(".crime-team").join("groups").join(&group_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let path = dir.join("presets.json");
+    let pretty = serde_json::to_string_pretty(&presets).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| format!("write {path:?}: {e}"))
 }
 
 /// Open the OS folder picker. Returns the absolute path the user chose,
@@ -931,12 +1128,16 @@ async fn run_openclaw(args: &[&str], stdin_data: Option<&[u8]>) -> Result<String
 }
 
 #[tauri::command]
-async fn settings_get() -> Result<SettingsSnapshot, String> {
+async fn settings_get(group_id: Option<String>) -> Result<SettingsSnapshot, String> {
     // agents.list — JSON array
     let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
     let agents_v: serde_json::Value = serde_json::from_str(&agents_json)
         .map_err(|e| format!("parse agents.list: {e}"))?;
-    let active_id = active_group_id().unwrap_or_else(|_| String::new());
+    // Filter to a specific group's agents — defaults to active group when None.
+    let active_id = match group_id {
+        Some(id) if !id.is_empty() => id,
+        _ => active_group_id().unwrap_or_else(|_| String::new()),
+    };
     let group_prefix = if active_id.is_empty() { String::new() } else { format!("{active_id}.") };
     let mut agents = Vec::new();
     if let Some(list) = agents_v.as_array() {
@@ -1080,18 +1281,20 @@ fn write_crime_team_json(v: &serde_json::Value) -> Result<(), String> {
 }
 
 /// Set or clear an agent's thinking-level override in .crime-team.json,
-/// scoped under the active group (perGroupThinking.<groupId>.<role>).
-/// agent_id may be fully-qualified ("crimeos.architect") or just the role.
+/// scoped under the agent's own group derived from its id prefix.
+/// agent_id MUST be fully-qualified ("crimeos.architect") — we split on the
+/// first '.' to get group + role. Falls back to active group on unprefixed id.
 #[tauri::command]
 async fn settings_set_agent_thinking(agent_id: String, thinking: String) -> Result<(), String> {
     const VALID: &[&str] = &["", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"];
     if !VALID.contains(&thinking.as_str()) {
         return Err(format!("invalid thinking level '{thinking}' — valid: {VALID:?}"));
     }
-    let group_id = active_group_id()?;
-    // Strip the group prefix if present, so the storage key is just the role.
-    let prefix = format!("{group_id}.");
-    let role = agent_id.strip_prefix(&prefix).unwrap_or(&agent_id).to_string();
+    // Derive group from the agent's id prefix; fall back to active for legacy / unprefixed ids.
+    let (group_id, role) = match agent_id.split_once('.') {
+        Some((g, r)) => (g.to_string(), r.to_string()),
+        None => (active_group_id()?, agent_id.clone()),
+    };
 
     let mut cfg = read_crime_team_json();
     if !cfg.is_object() { cfg = serde_json::json!({}); }
@@ -1219,6 +1422,12 @@ pub fn run() {
             groups_browse_directory,
             groups_scan_project,
             groups_create,
+            groups_get_presets,
+            groups_set_presets,
+            groups_edit,
+            groups_remove,
+            groups_get_prompt,
+            groups_set_prompt,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

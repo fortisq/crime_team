@@ -1,7 +1,12 @@
 // Frontend entry. Talks to Tauri via window.__TAURI__.{core,event}.
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-import { PRESETS, ANGLES } from "./presets.js";
+import { PRESETS as BUNDLED_PRESETS, ANGLES as BUNDLED_ANGLES } from "./presets.js";
+
+// Mutable per-group preset state. Replaced by loadPresetsForActiveGroup()
+// when the active group has a presets.json at ~/.crime-team/groups/<id>/.
+let PRESETS = BUNDLED_PRESETS;
+let ANGLES = BUNDLED_ANGLES;
 
 const els = {
   taskInput:   document.getElementById("taskInput"),
@@ -36,7 +41,24 @@ const els = {
 };
 
 // --- preset dropdown population + wiring ---
+async function loadPresetsForActiveGroup() {
+  if (!activeGroup) { PRESETS = BUNDLED_PRESETS; ANGLES = BUNDLED_ANGLES; return; }
+  try {
+    const data = await invoke("groups_get_presets", { groupId: activeGroup.id });
+    if (data && Array.isArray(data.presets) && data.presets.length > 0) {
+      PRESETS = data.presets;
+      ANGLES = Array.isArray(data.angles) && data.angles.length ? data.angles : BUNDLED_ANGLES;
+      return;
+    }
+  } catch {}
+  PRESETS = BUNDLED_PRESETS;
+  ANGLES = BUNDLED_ANGLES;
+}
+
 function populatePresets() {
+  // Clear before rebuilding (called on group switch + initial load)
+  els.presetSelect.innerHTML = '<option value="">— Pick a preset —</option>';
+  els.angleSelect.innerHTML = "";
   // Build the <optgroup>s for the preset select.
   for (const { group, items } of PRESETS) {
     const og = document.createElement("optgroup");
@@ -100,9 +122,16 @@ const RUNID_RE = /^\[info\s*\]\s*runId=(\S+)/;
 const SPIN_START_RE = /^\s*·\s+(.+?)$/;
 const SPIN_OK_RE    = /^\s*ok:\s*(.+?)\s*\((\d+(?:\.\d+)?)s\)\s*$/;
 const SPIN_FAIL_RE  = /^\s*FAIL:\s*(.+?)\s*\((\d+(?:\.\d+)?)s\)\s*$/;
-const SPIN_TTY_RE   = /^\s*[✓✗]\s+(.+?)\s*\((\d+(?:\.\d+)?)s\)/;
+// Capture the spinner glyph in a group so success/fail can be told apart
+// without resorting to line.includes("ok") (which misfires on labels like
+// "Look for bugs" because "Look" contains "ok").
+const SPIN_TTY_RE   = /^\s*([✓✗])\s+(.+?)\s*\((\d+(?:\.\d+)?)s\)/;
 const SPECIALISTS_RE= /Producer wants \d+ specialist\(s\):\s*(.+)$/;
-const AGENT_FROM_LABEL_RE = /^(producer|architect|frontend|art-director|qa|security)(?:\s|:|$)/;
+// Fallback roles for when the active group hasn't loaded yet (e.g. early in
+// startup or for an inline answer before the group dropdown fires). The
+// authoritative source is the active group's specialist list — see
+// `agentNameFromLabel`.
+const FALLBACK_ROLES = ["producer","architect","frontend","art-director","qa","security","backend","desktop"];
 const ANSWER_HEADER = "PRODUCER'S INTEGRATED ANSWER";
 const ANSWER_SEP    = "========================================================================";
 const DONE_RE       = /done\. runId=\S+\. total\s+([\d.]+)s/;
@@ -142,6 +171,33 @@ function roleOf(agentId) {
   if (!activeGroup) return agentId;
   const prefix = activeGroup.id + ".";
   return agentId.startsWith(prefix) ? agentId.slice(prefix.length) : agentId;
+}
+
+/**
+ * Extract the agent name (role) from the start of a spinner label like
+ * "backend: Read-only Findings pass…" or just "producer planning".
+ *
+ * Validates the candidate against the active group's roster + a fallback
+ * list. The old hardcoded regex (`producer|architect|frontend|art-director|
+ * qa|security`) silently dropped role names from any new group — which is
+ * why backend and desktop sat on "waiting…" forever.
+ */
+function agentNameFromLabel(label) {
+  if (!label) return null;
+  const m = label.match(/^([A-Za-z][A-Za-z0-9_-]*)/);
+  if (!m) return null;
+  const candidate = m[1].toLowerCase();
+  if (candidate === "producer") return "producer";
+  if (activeGroup && Array.isArray(activeGroup.specialists)) {
+    for (const id of activeGroup.specialists) {
+      const role = (id.startsWith(activeGroup.id + ".")
+        ? id.slice(activeGroup.id.length + 1)
+        : id).toLowerCase();
+      if (role === candidate) return role;
+    }
+  }
+  if (FALLBACK_ROLES.includes(candidate)) return candidate;
+  return null;
 }
 
 function emoji(agent) {
@@ -224,24 +280,37 @@ function parseLine(rawLine) {
   const startM = line.match(SPIN_START_RE);
   if (startM) {
     const label = startM[1];
-    const a = label.match(AGENT_FROM_LABEL_RE);
-    if (a) setAgent(a[1], { status: "running", label });
+    const a = agentNameFromLabel(label);
+    if (a) setAgent(a, { status: "running", label });
   }
 
   // spinner OK (non-TTY: "  ok: <label> (Ns)")
-  const okM = line.match(SPIN_OK_RE) || line.match(SPIN_TTY_RE);
-  if (okM && line.includes("ok")) {
+  const okM = line.match(SPIN_OK_RE);
+  if (okM) {
     const label = okM[1];
     const elapsed = parseFloat(okM[2]);
-    const a = label.match(AGENT_FROM_LABEL_RE);
-    if (a) setAgent(a[1], { status: "ok", label, elapsed });
+    const a = agentNameFromLabel(label);
+    if (a) setAgent(a, { status: "ok", label, elapsed });
   }
+  // spinner FAIL (non-TTY: "  FAIL: <label> (Ns)")
   const failM = line.match(SPIN_FAIL_RE);
   if (failM) {
     const label = failM[1];
     const elapsed = parseFloat(failM[2]);
-    const a = label.match(AGENT_FROM_LABEL_RE);
-    if (a) setAgent(a[1], { status: "fail", label, elapsed });
+    const a = agentNameFromLabel(label);
+    if (a) setAgent(a, { status: "fail", label, elapsed });
+  }
+  // spinner TTY (real terminal: "  ✓ <label> (Ns)" or "  ✗ <label> (Ns)").
+  // Use the captured glyph — not line.includes("ok") — to disambiguate, so
+  // labels like "Look for bugs" (which contain "ok" as a substring) don't
+  // mark a failed run as successful.
+  const ttyM = line.match(SPIN_TTY_RE);
+  if (ttyM) {
+    const status = ttyM[1] === "✓" ? "ok" : "fail";
+    const label = ttyM[2];
+    const elapsed = parseFloat(ttyM[3]);
+    const a = agentNameFromLabel(label);
+    if (a) setAgent(a, { status, label, elapsed });
   }
 
   // answer header detection — start collecting after the second "===" separator
@@ -489,6 +558,7 @@ const settingsEls = {
   status:       document.getElementById("settingsStatus"),
   providersTbody: document.querySelector("#providersTable tbody"),
   agentsTbody:    document.querySelector("#agentsTable tbody"),
+  groupsTbody:    document.querySelector("#groupsTable tbody"),
   addProvider:    document.getElementById("addProviderSelect"),
   addProfileId:   document.getElementById("addProfileIdInput"),
   addApiKey:      document.getElementById("addApiKeyInput"),
@@ -555,12 +625,236 @@ async function loadSettings() {
   try {
     const snap = await invoke("settings_get");
     renderProviders(snap.profiles);
-    renderAgentsTable(snap.agents);
+    // Per-agent model + thinking moved into the Edit Group modal — no
+    // longer rendered here. (See egState / renderEgAgentsTable.)
+    await renderGroupsTable();
     settingsEls.status.textContent = "";
   } catch (e) {
     settingsEls.status.textContent = `load failed: ${e}`;
   }
 }
+
+async function renderGroupsTable() {
+  if (!settingsEls.groupsTbody) return;
+  settingsEls.groupsTbody.innerHTML = "";
+  const file = await invoke("groups_list");
+  for (const g of file.groups ?? []) {
+    const tr = document.createElement("tr");
+    const isActive = g.id === file.activeGroupId;
+    const agentCount = (g.specialists?.length ?? 0) + 1; // +1 for producer
+    tr.innerHTML = `
+      <td><span style="font-size:16px">${escapeHtml(g.emoji)}</span> <strong>${escapeHtml(g.displayName)}</strong>${isActive ? ' <span class="muted">(active)</span>' : ''}<div class="muted" style="font-size:11px">${escapeHtml(g.id)}</div></td>
+      <td class="mono" style="font-size:11.5px">${escapeHtml(g.workspace)}</td>
+      <td class="mono">${agentCount}</td>
+      <td class="actions row-actions">
+        ${isActive ? "" : '<button class="ghost small" data-action="activate">Make active</button>'}
+        <button class="ghost small" data-action="edit">Edit</button>
+        <button class="danger small" data-action="remove" ${file.groups.length <= 1 ? "disabled" : ""}>Remove</button>
+      </td>
+    `;
+    tr.querySelector('[data-action="activate"]')?.addEventListener("click", async () => {
+      try { await invoke("groups_set_active", { groupId: g.id }); await loadGroups(); await loadPresetsForActiveGroup(); populatePresets(); await refreshRuns(); await renderGroupsTable(); }
+      catch (e) { alert("activate failed: " + e); }
+    });
+    tr.querySelector('[data-action="edit"]')?.addEventListener("click", () => openEditGroup(g));
+    tr.querySelector('[data-action="remove"]')?.addEventListener("click", async () => {
+      if (!confirm(`Remove group "${g.displayName}"?\n\nThis deletes:\n  • ${agentCount} agents\n  • their system prompts\n  • runs/${g.id}/ history\n  • the group's preset library\n\nThis cannot be undone.`)) return;
+      try {
+        await invoke("groups_remove", { groupId: g.id });
+        await loadGroups();
+        await loadPresetsForActiveGroup(); populatePresets();
+        await refreshRuns();
+        await loadSettings();
+      } catch (e) { alert("remove failed: " + e); }
+    });
+    settingsEls.groupsTbody.appendChild(tr);
+  }
+}
+
+// --- Group editor modal ---
+
+const egEls = {
+  modal:       document.getElementById("editGroupModal"),
+  title:       document.getElementById("egGroupTitle"),
+  closeBtn:    document.getElementById("egCloseBtn"),
+  cancelBtn:   document.getElementById("egCancelBtn"),
+  saveBtn:     document.getElementById("egSaveBtn"),
+  status:      document.getElementById("egStatus"),
+  name:        document.getElementById("egName"),
+  emoji:       document.getElementById("egEmoji"),
+  workspace:   document.getElementById("egWorkspace"),
+  browseBtn:   document.getElementById("egBrowseBtn"),
+  promptTabs:  document.getElementById("egPromptTabs"),
+  promptEditor: document.getElementById("egPromptEditor"),
+  promptMeta:  document.getElementById("egPromptMeta"),
+  agentsTbody: document.querySelector("#egAgentsTable tbody"),
+};
+let egState = {
+  group: null,
+  prompts: {},                  // qualifiedId -> markdown
+  activeTab: "",
+  dirtyMeta: false,
+  dirtyPrompts: new Set(),
+  pendingAgentChanges: {},      // qualifiedId -> { primary?, thinking? }
+};
+
+async function openEditGroup(group) {
+  egState = { group, prompts: {}, activeTab: "", dirtyMeta: false, dirtyPrompts: new Set(), pendingAgentChanges: {} };
+  egEls.title.textContent = `· ${group.emoji} ${group.displayName}`;
+  egEls.name.value = group.displayName;
+  egEls.emoji.value = group.emoji;
+  egEls.workspace.value = group.workspace;
+  egEls.status.textContent = "loading…";
+
+  // Load each agent's prompt
+  const allIds = [group.producerAgentId, ...group.specialists];
+  for (const id of allIds) {
+    try { egState.prompts[id] = await invoke("groups_get_prompt", { agentId: id }); }
+    catch (e) { egState.prompts[id] = `[failed to load: ${e}]`; }
+  }
+  egState.activeTab = allIds[0];
+
+  // Load this group's agents (scoped via the new settings_get groupId arg)
+  try {
+    const snap = await invoke("settings_get", { groupId: group.id });
+    renderEgAgentsTable(snap.agents);
+  } catch (e) {
+    egEls.agentsTbody.innerHTML = `<tr><td colspan="4" class="muted">load failed: ${escapeHtml(String(e))}</td></tr>`;
+  }
+
+  egEls.status.textContent = "";
+  renderEgTabs();
+  egEls.modal.classList.remove("hidden");
+}
+
+function renderEgAgentsTable(agents) {
+  egEls.agentsTbody.innerHTML = "";
+  const all = allCatalogedModels();
+  for (const a of agents) {
+    const role = a.id.startsWith(egState.group.id + ".") ? a.id.slice(egState.group.id.length + 1) : a.id;
+    const options = new Set(all);
+    if (a.primary) options.add(a.primary);
+    const sortedOpts = Array.from(options).sort();
+    const thinkingLevels = thinkingLevelsFor(a.primary);
+    const currentThinking = a.thinking ?? "";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${emoji(a.id)} ${escapeHtml(role)}</td>
+      <td class="mono">${escapeHtml(a.primary || "(none)")}</td>
+      <td>
+        <select data-agent="${escapeHtml(a.id)}" data-field="primary">
+          ${sortedOpts.map(m => `<option value="${escapeHtml(m)}"${m === a.primary ? " selected" : ""}>${escapeHtml(m)}</option>`).join("")}
+        </select>
+      </td>
+      <td>
+        <select data-agent="${escapeHtml(a.id)}" data-field="thinking">
+          ${renderThinkingOptions(thinkingLevels, currentThinking)}
+        </select>
+      </td>
+    `;
+    const modelSel = tr.querySelector('select[data-field="primary"]');
+    const thinkSel = tr.querySelector('select[data-field="thinking"]');
+    if (thinkingLevels.length <= 2) thinkSel.title = "This model does not support extended thinking.";
+
+    modelSel.addEventListener("change", () => {
+      egState.pendingAgentChanges[a.id] = egState.pendingAgentChanges[a.id] ?? {};
+      if (modelSel.value !== a.primary) egState.pendingAgentChanges[a.id].primary = modelSel.value;
+      else delete egState.pendingAgentChanges[a.id].primary;
+      // Refresh thinking dropdown for the new model
+      const newLevels = thinkingLevelsFor(modelSel.value);
+      const keep = newLevels.includes(thinkSel.value) ? thinkSel.value : "";
+      thinkSel.innerHTML = renderThinkingOptions(newLevels, keep);
+      thinkSel.title = newLevels.length <= 2 ? "This model does not support extended thinking." : "";
+      if (keep !== currentThinking) {
+        egState.pendingAgentChanges[a.id].thinking = keep;
+      }
+    });
+    thinkSel.addEventListener("change", () => {
+      egState.pendingAgentChanges[a.id] = egState.pendingAgentChanges[a.id] ?? {};
+      if (thinkSel.value !== currentThinking) egState.pendingAgentChanges[a.id].thinking = thinkSel.value;
+      else delete egState.pendingAgentChanges[a.id].thinking;
+    });
+
+    egEls.agentsTbody.appendChild(tr);
+  }
+}
+function hideEditGroup() { egEls.modal.classList.add("hidden"); }
+
+function renderEgTabs() {
+  egEls.promptTabs.innerHTML = "";
+  const order = [egState.group.producerAgentId, ...egState.group.specialists];
+  for (const id of order) {
+    const role = id.startsWith(egState.group.id + ".") ? id.slice(egState.group.id.length + 1) : id;
+    const dirty = egState.dirtyPrompts.has(id) ? " •" : "";
+    const t = document.createElement("button");
+    t.className = "prompt-tab" + (id === egState.activeTab ? " active" : "");
+    t.textContent = role + dirty;
+    t.addEventListener("click", () => {
+      egState.prompts[egState.activeTab] = egEls.promptEditor.value;
+      egState.activeTab = id;
+      renderEgTabs();
+    });
+    egEls.promptTabs.appendChild(t);
+  }
+  egEls.promptEditor.value = egState.prompts[egState.activeTab] ?? "";
+  egEls.promptMeta.textContent = `${egEls.promptEditor.value.length} chars · editing ${egState.activeTab}.md`;
+  egEls.promptEditor.oninput = () => {
+    egState.dirtyPrompts.add(egState.activeTab);
+    egEls.promptMeta.textContent = `${egEls.promptEditor.value.length} chars · editing ${egState.activeTab}.md (unsaved)`;
+  };
+}
+
+[egEls.name, egEls.emoji, egEls.workspace].forEach(el => el?.addEventListener("input", () => { egState.dirtyMeta = true; }));
+egEls.browseBtn?.addEventListener("click", async () => {
+  try { const p = await invoke("groups_browse_directory"); if (p) { egEls.workspace.value = p; egState.dirtyMeta = true; } }
+  catch (e) { egEls.status.textContent = `browse failed: ${e}`; }
+});
+egEls.saveBtn?.addEventListener("click", async () => {
+  egState.prompts[egState.activeTab] = egEls.promptEditor.value;
+  egEls.saveBtn.disabled = true;
+  egEls.status.textContent = "saving…";
+  try {
+    if (egState.dirtyMeta) {
+      await invoke("groups_edit", {
+        groupId: egState.group.id,
+        displayName: egEls.name.value,
+        emoji: egEls.emoji.value,
+        workspace: egEls.workspace.value !== egState.group.workspace ? egEls.workspace.value : null,
+      });
+    }
+    for (const id of egState.dirtyPrompts) {
+      await invoke("groups_set_prompt", { agentId: id, prompt: egState.prompts[id] });
+    }
+    // Per-agent model + thinking changes (uses the same commands as before,
+    // but the agent ids are already fully-qualified so they correctly target
+    // this group regardless of which group is "active").
+    const agentChanges = Object.entries(egState.pendingAgentChanges);
+    if (agentChanges.length > 0) {
+      egEls.status.textContent = `applying ${agentChanges.length} agent change(s)…`;
+      for (const [agentId, change] of agentChanges) {
+        if (change.primary !== undefined) {
+          await invoke("settings_set_agent_model", { agentId, primary: change.primary });
+        }
+        if (change.thinking !== undefined) {
+          await invoke("settings_set_agent_thinking", { agentId, thinking: change.thinking });
+        }
+      }
+      await invoke("settings_restart_gateway");
+    }
+    egEls.status.textContent = "saved.";
+    await loadGroups();
+    await renderGroupsTable();
+    hideEditGroup();
+  } catch (e) {
+    egEls.status.textContent = `save failed: ${e}`;
+  } finally {
+    egEls.saveBtn.disabled = false;
+  }
+});
+egEls.closeBtn?.addEventListener("click", hideEditGroup);
+egEls.cancelBtn?.addEventListener("click", hideEditGroup);
+egEls.modal?.addEventListener("click", (e) => { if (e.target === egEls.modal) hideEditGroup(); });
 
 function renderProviders(profiles) {
   settingsEls.providersTbody.innerHTML = "";
@@ -1192,6 +1486,8 @@ els.groupSelect?.addEventListener("change", async () => {
     await invoke("groups_set_active", { groupId: newId });
     activeGroup = groupsList.find(g => g.id === newId) ?? null;
     // Reload everything scoped to the new active group
+    await loadPresetsForActiveGroup();
+    populatePresets();
     await refreshRuns();
     document.querySelectorAll(".run-item.active").forEach(el => el.classList.remove("active"));
     showSections({ status: false, log: false, answer: false });
@@ -1202,9 +1498,10 @@ els.groupSelect?.addEventListener("change", async () => {
 
 // Initial load
 (async () => {
-  populatePresets();
   loadToggleState();
-  await loadGroups();        // populate dropdown FIRST so emoji() etc. know the active group
+  await loadGroups();                  // sets activeGroup so the rest of the load knows scope
+  await loadPresetsForActiveGroup();   // reads ~/.crime-team/groups/<active>/presets.json
+  populatePresets();                   // builds dropdowns from PRESETS/ANGLES (group's or fallback)
   try { els.rootPath.textContent = await invoke("orchestrator_path"); } catch {}
   await refreshRuns();
 })();
