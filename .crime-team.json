@@ -16,11 +16,26 @@
     },
     "crimeos": {
       "architect": "high",
-      "art-director": "low",
+      "art-director": "high",
+      "coder": "high",
       "frontend": "medium",
+      "game-balance": "high",
       "producer": "high",
       "qa": "medium",
-      "security": "max"
+      "security": "high"
+    },
+    "myproject": {
+      "backend-srv": "high",
+      "build-ops": "medium",
+      "coder": "max",
+      "content-bp": "medium",
+      "gameplay-cpp": "high",
+      "level-design": "medium",
+      "music-sfx": "medium",
+      "netcode": "high",
+      "producer": "max",
+      "qa": "medium",
+      "ux-ui": "medium"
     }
   }
 }
