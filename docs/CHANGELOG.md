@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-01 — drop unused shell plugin (FOLLOWUPS D1)
+
+The `shell:default` capability let the JS frontend invoke shell/process commands, but nothing used it — all spawning is in trusted Rust. Pure attack surface if local content were ever compromised.
+
+- Verified the shell plugin is 100% unused (no `shell` JS API calls; the only Rust reference was `tauri_plugin_shell::init()`), then removed all three: the `shell:default` grant (`capabilities/default.json`), the plugin registration (`lib.rs`), and the `tauri-plugin-shell` dependency (`Cargo.toml`). The Tauri ACL manifests under `gen/schemas/` regenerated accordingly.
+- The `dialog` plugin (the directory picker in `groups_browse_directory`) is untouched. `cargo build`/`cargo test --lib` (9) clean; GUI still launches.
+
 ## 2026-06-01 — citation guard: handle basename collisions (FOLLOWUPS D2)
 
 The hallucination guard resolved a cited `file:line` by basename and, on a collision (multiple same-named files), validated the line against an arbitrary `matches[0]` — so it could "verify" the wrong file, or falsely fail a real citation whose line happened to be out of range in the pick but valid in the intended file.

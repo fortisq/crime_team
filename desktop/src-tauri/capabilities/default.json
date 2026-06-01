@@ -8,7 +8,6 @@
     "core:event:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "shell:default",
     "dialog:default"
   ]
 }

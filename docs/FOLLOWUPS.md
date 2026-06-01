@@ -52,7 +52,7 @@ Severity = blast radius if it bites · Effort = S (≲1h) / M (a few h) / L (a d
 
 | ID | Item | Sev | Eff | Where | Fix |
 |---|---|---|---|---|---|
-| D1 | **Unused `shell:default` capability.** Granted to the JS frontend, which never spawns processes (all spawning is in trusted Rust) — pure attack surface if local content is ever compromised. | LOW | S | `capabilities/default.json:11` | Remove the grant. |
+| D1 | ✅ **RESOLVED.** Unused `shell:default` capability. **Fixed:** the shell plugin was 100% unused (no JS `shell` API calls, no Rust usage beyond `init()`), so removed the `shell:default` grant **and** the plugin registration + the `tauri-plugin-shell` dependency — closes the attack surface and drops a dep. | — | — | `capabilities/default.json`, `lib.rs`, `Cargo.toml` | done |
 
 ## Resolved this cycle
 
