@@ -94,7 +94,7 @@ Drop a `.crime-team.json` in your CWD to set per-group thinking levels (and, opt
 
 ## Requires
 
-- Node.js 18+ (you have 22+)
+- Node.js 18+ (you have 22+). If `node` isn't on PATH (nvm/Volta/fnm, or the GUI launched from a shortcut), set `CRIME_TEAM_NODE=<full path to node>` — both the CLI orchestrator and the desktop app honor it.
 - OpenClaw installed with the active group's team configured. The dispatched roster is whatever is in that group's `specialists[]` in `~/.crime-team/groups.json` and **varies per project** (Crime OS ships 5 — architect / frontend / art-director / qa / security — plus the producer). The 6 names in `src/config.ts` `DEFAULT_PER_AGENT` are **timeout fallbacks only**, not the dispatch list — editing them does not change who runs. See `~\.openclaw\team-prompts\HOW-TO.md`.
 - `openclaw.cmd` discoverable on PATH (default install puts it at `%APPDATA%\npm\openclaw.cmd`). Override with `OPENCLAW_BIN=...` env var.
 

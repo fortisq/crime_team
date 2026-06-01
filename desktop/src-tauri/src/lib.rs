@@ -245,7 +245,7 @@ async fn run_task(
         args.push(t.to_string());
     }
 
-    let mut child = Command::new("node")
+    let mut child = Command::new(node_bin())
         .args(&args)
         .current_dir(&root)
         .stdout(Stdio::piped())
@@ -2248,11 +2248,18 @@ struct SettingsSnapshot {
     profiles: Vec<ProviderProfile>,
 }
 
+/// The Node binary to spawn. Honors CRIME_TEAM_NODE (else "node" on PATH), so a
+/// machine without node on PATH can be made to work by setting the env var.
+/// Shared by run_task and run_openclaw so the resolution can't drift between
+/// them (run_task used to hardcode "node", failing every run on such a machine).
+fn node_bin() -> String {
+    std::env::var("CRIME_TEAM_NODE").unwrap_or_else(|_| "node".to_string())
+}
+
 fn openclaw_bin() -> (String, String) {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
-    let node = std::env::var("CRIME_TEAM_NODE").unwrap_or_else(|_| "node".to_string());
     let openclaw = format!("{appdata}\\npm\\node_modules\\openclaw\\openclaw.mjs");
-    (node, openclaw)
+    (node_bin(), openclaw)
 }
 
 /// Run `openclaw <args>` capturing stdout. Returns Err with stderr on non-zero exit.

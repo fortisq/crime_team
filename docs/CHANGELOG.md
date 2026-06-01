@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-06-01 — consistent Node resolution (FOLLOWUPS A2)
+
+`run_task` spawned a bare `Command::new("node")` while `run_openclaw` honored `CRIME_TEAM_NODE` — so on a machine without `node` on PATH (e.g. nvm/Volta/fnm, or launched from a shortcut), every run failed at spawn even though the env-var escape hatch existed for the other path.
+
+- Extracted a shared `node_bin()` helper (`CRIME_TEAM_NODE` → else `"node"`); both `run_task` and `run_openclaw` (via `openclaw_bin`) now resolve Node through it, so setting `CRIME_TEAM_NODE=<path-to-node>` reliably fixes a missing-PATH install. `cargo build`/`cargo test --lib` (9) clean.
+
 ## 2026-06-01 — drop unused shell plugin (FOLLOWUPS D1)
 
 The `shell:default` capability let the JS frontend invoke shell/process commands, but nothing used it — all spawning is in trusted Rust. Pure attack surface if local content were ever compromised.
