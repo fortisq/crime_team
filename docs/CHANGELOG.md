@@ -29,6 +29,7 @@ Acting on the orchestrator's self-run observability audit (~45 findings across t
 - GUI stays in **dual mode** (Rust does not pass `--json`) so the log panel keeps the human lines while events drive state — cleaner than the GUI passing `--json` (which would empty the log). `--json` is a CLI/automation convenience.
 - emoji fix is a deterministic per-role palette (pure JS), not the user's wizard-assigned emoji (would need plumbing emoji through `settings_get` — a follow-up).
 - Verified end-to-end with a real `--json` inline run (exit 0 → env allow-list does not break openclaw auth; clean event stream; `dispatchMode: "inline"` persisted).
+- Remaining deferred items from both self-audits (orphaned-subprocess kill, atomic config writes, distribution story, per-iteration loop answers, integration tests, …) are tracked, verified against source, in [FOLLOWUPS.md](FOLLOWUPS.md).
 
 ## 2026-06-01 — self-audit fixes (runId unification, rollback safety, tests)
 
