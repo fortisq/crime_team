@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 
 /// Shared handle to the currently running orchestrator subprocess (if any).
@@ -150,6 +150,57 @@ fn note_drop(drops: &std::sync::atomic::AtomicU64) {
     let n = drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n == 1 || n % 100 == 0 {
         eprintln!("[ct] dropped {n} orchestrator event(s) — frontend gone?");
+    }
+}
+
+/// Hard per-line cap for the child-stream pumps. A DoS guard, NOT a content
+/// limit: it sits far above any real line (an `@@CTEVT@@` answer event is a
+/// large but bounded JSON line, well under this), and only trips on a
+/// pathological no-newline blob — which `lines()`/`next_line()` would otherwise
+/// accumulate into an unbounded String and flush to the webview in one shot.
+const MAX_PUMP_LINE: usize = 1024 * 1024;
+
+/// Read a child stream line-by-line with a per-line byte cap. Splits on '\n'
+/// (stripping a trailing '\r' to match `next_line` semantics); bytes past the
+/// cap for an over-long line are dropped and the emitted line is flagged
+/// truncated. `on_line` is invoked once per (capped) line, including a final
+/// partial line at EOF.
+async fn pump_lines<R, F>(stream: R, mut on_line: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(String),
+{
+    use tokio::io::AsyncReadExt;
+    let mut reader = BufReader::new(stream);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    let finish = |buf: &mut Vec<u8>, truncated: &mut bool| -> String {
+        if buf.last() == Some(&b'\r') { buf.pop(); }
+        let mut s = String::from_utf8_lossy(buf).into_owned();
+        if *truncated { s.push_str(" …[line truncated at 1 MB]"); }
+        buf.clear();
+        *truncated = false;
+        s
+    };
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        for &b in &chunk[..n] {
+            if b == b'\n' {
+                on_line(finish(&mut buf, &mut truncated));
+            } else if buf.len() < MAX_PUMP_LINE {
+                buf.push(b);
+            } else {
+                truncated = true; // drop the rest of this over-long line
+            }
+        }
+    }
+    if !buf.is_empty() || truncated {
+        on_line(finish(&mut buf, &mut truncated));
     }
 }
 
@@ -294,21 +345,20 @@ async fn run_task(
         let id = run_id_emit.clone();
         let drops = drop_count.clone();
         tauri::async_runtime::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
+            pump_lines(stdout, |line| {
                 if let Some(rest) = line.strip_prefix(EVENT_SENTINEL) {
                     if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(rest) {
                         if let Some(o) = v.as_object_mut() {
                             o.entry("runId").or_insert_with(|| serde_json::Value::String(id.clone()));
                         }
                         if app_out.emit("orchestrator:event", v).is_err() { note_drop(&drops); }
-                        continue;
+                        return;
                     }
                 }
                 if app_out.emit("orchestrator:line", RunLine {
                     run_id: id.clone(), stream: "stdout", line,
                 }).is_err() { note_drop(&drops); }
-            }
+            }).await;
         });
     }
 
@@ -318,12 +368,11 @@ async fn run_task(
         let id = run_id_emit.clone();
         let drops = drop_count.clone();
         tauri::async_runtime::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
+            pump_lines(stderr, |line| {
                 if app_err.emit("orchestrator:line", RunLine {
                     run_id: id.clone(), stream: "stderr", line,
                 }).is_err() { note_drop(&drops); }
-            }
+            }).await;
         });
     }
 
@@ -2774,6 +2823,20 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"v\":2}");
         assert!(!dir.join(".groups.json.tmp").exists(), "temp file lingered");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // pump_lines must split on newlines (stripping \r), cap an over-long
+    // no-newline line (DoS guard) with a marker, and flush a trailing partial.
+    #[tokio::test]
+    async fn pump_lines_caps_long_lines_and_splits_on_newlines() {
+        let big = "Z".repeat(MAX_PUMP_LINE + 500);
+        let bytes = format!("short\r\n{big}\nafter").into_bytes(); // last line: no \n
+        let mut out: Vec<String> = Vec::new();
+        pump_lines(&bytes[..], |l| out.push(l)).await; // &[u8] impls AsyncRead
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "short"); // \r\n stripped to match next_line
+        assert!(out[1].len() <= MAX_PUMP_LINE + 40 && out[1].contains("truncated"));
+        assert_eq!(out[2], "after"); // trailing partial line flushed at EOF
     }
 
     // The kill-on-close job must terminate an assigned process when the job's

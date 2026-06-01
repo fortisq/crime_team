@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-01 — cap per-line buffering in the stream pumps (FOLLOWUPS A3)
+
+The stdout/stderr pumps used `BufReader::lines()`/`next_line()`, which read to `\n` with no cap — a pathological multi-MB no-newline blob (a binary dump, a runaway log) would accumulate into one unbounded `String` and then flush to the webview in a single shot.
+
+- Replaced both pumps with a `pump_lines` helper that reads in fixed 8 KB chunks, splits on `\n` (stripping a trailing `\r` to match `next_line`), and caps each emitted line at **1 MB** — a DoS guard sized far above any legitimate line (the `@@CTEVT@@` answer event is large but bounded, well under the cap), so real content is never truncated; only a pathological over-long line is cut, flagged `[line truncated at 1 MB]`. The stdout pump keeps its sentinel event-split + drop counter; stderr stays line-only.
+- Test: `pump_lines_caps_long_lines_and_splits_on_newlines`. `cargo test --lib` → 10; GUI still launches.
+
 ## 2026-06-01 — consistent Node resolution (FOLLOWUPS A2)
 
 `run_task` spawned a bare `Command::new("node")` while `run_openclaw` honored `CRIME_TEAM_NODE` — so on a machine without `node` on PATH (e.g. nvm/Volta/fnm, or launched from a shortcut), every run failed at spawn even though the env-var escape hatch existed for the other path.
