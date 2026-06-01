@@ -38,15 +38,15 @@ Severity = blast radius if it bites · Effort = S (≲1h) / M (a few h) / L (a d
 |---|---|---|---|---|---|
 | E2 | **`--loop` answer panel shows only the last iteration.** Each `answer` event overwrites `activeRun.answer`; per-iteration answers + Coder reports aren't separately viewable. (Better than the old concatenation, but lossy.) | MED | M | `src/orchestrator.ts:549,691` → `main.js:423` | Key answers by `evt.iteration`; render an accordion/section per iteration. |
 | E6 | **Per-agent emoji not plumbed to the GUI.** `AgentSetting` has no `emoji` field, so the GUI can't show the wizard-assigned emoji — it falls back to a derived palette (this overhaul) instead of the user's choice. | LOW | M | `lib.rs:2069-2084`, `settings_get` `:2122` | Add `emoji` to `AgentSetting`, populate it in `settings_get`, cache role→emoji in the GUI. |
-| E7 | **History-item runIds aren't copyable.** The active-run runId is now click-to-copy, but the sidebar items render `runId` as plain muted text. | LOW | S | `main.js:613-638` | Reuse the runId-chip copy affordance for history items. |
+| E7 | ✅ **RESOLVED.** History-item runIds weren't copyable. **Fixed:** each sidebar run's runId is now click-to-copy (`.run-id-copy`, `stopPropagation` so it doesn't trigger the row's loadRun), with a "copied!" flash. | — | — | `main.js` `refreshRuns` | done |
 | E3 | **No structured logging in Rust.** Everything is stringly-typed `Result<_, String>`; no `tracing`/`log`, no timestamps/levels/file sink. Long errors get sliced to 200–400 chars in the GUI. | LOW | S | `Cargo.toml`, `lib.rs` throughout | Add `tracing-subscriber` with a stderr/file sink; `#[instrument]` the command handlers. |
-| E5 | **Salvage script is CLI-only and rigid.** `scripts/salvage-integrate.mjs` hardcodes `thinking:"high"` and has no overrides; recovery isn't reachable from the GUI. (Producer is resolved from `groups.json` by group id, so it's robust to most changes.) | LOW | S | `scripts/salvage-integrate.mjs:111,124,144` | Add `--thinking`/`--producer` flags; consider a GUI "re-integrate" button. |
+| E5 | ✅ **RESOLVED.** Salvage script was rigid. **Fixed:** added `--thinking <level>` (defaults to "high") and `--producer <agentId>` (overrides the group's Producer, e.g. after a model swap) flags. A GUI "re-integrate" button is still a possible nice-to-have. | — | — | `scripts/salvage-integrate.mjs` | done |
 
 ## Priority 5 — testing
 
 | ID | Item | Sev | Eff | Where | Fix |
 |---|---|---|---|---|---|
-| E1 | **No integration tests for the orchestration flow.** Tests cover pure functions + the new event/agent-safety units; `orchestrate()`, retry-on-timeout, 0-dispatch→auto-fan-out, and all-specialists-failed paths are unexercised. | MED | M | `test/` | Add `orchestrate()` integration tests with a mocked `callAgent` asserting retry, dispatch-mode, and failure-path records. |
+| E1 | ✅ **RESOLVED.** No integration tests for the orchestration flow. **Fixed:** `orchestrate()` now accepts an injectable `call` (defaults to the real `callAgent`); `test/orchestrate.test.mjs` drives the full flow with a mocked agent — covering inline answer, parallel dispatch+integrate, retry-on-timeout (asserts `retried`), and all-specialists-failed (asserts `failurePhase`) by reading the persisted RunRecord. | — | — | `orchestrator.ts`, `test/orchestrate.test.mjs` | done |
 
 ## Security
 

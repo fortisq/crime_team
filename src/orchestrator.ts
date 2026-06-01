@@ -21,6 +21,8 @@ export interface OrchestratorOpts {
   runId?: string;
   /** Emit machine-readable NDJSON events only (suppress human log + spinner). */
   json?: boolean;
+  /** Injectable agent-call fn (defaults to the real `callAgent`). For tests. */
+  call?: typeof callAgent;
   verbose: boolean;
   /**
    * When true, Producer judges which specialists are actually needed instead
@@ -65,6 +67,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
   const runId = opts.runId
     ?? `team-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const em = createEmitter(runId, !!opts.json);
+  const call = opts.call ?? callAgent;
   const record: RunRecord = {
     runId,
     startedAt: new Date().toISOString(),
@@ -114,7 +117,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
   // matter how we exit (success / error / soft-cancel / hard kill mid-finally).
   try {
     // --- Iteration 1: audit + (optionally) Coder ---
-    const iter1 = await runAuditPhases(opts.task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist, em);
+    const iter1 = await runAuditPhases(opts.task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist, em, call);
     // runAuditPhases mutates record's top-level audit fields (producerPlan,
     // dispatches, specialistResults, finalAnswer) for iteration 1.
     if (iter1.exitCode !== 0) {
@@ -158,7 +161,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       return 0;
     }
 
-    record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId, em);
+    record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId, em, call);
     await persist();
     printCoderReport(record.coderResult, 1, roleOf(coderId, opts.cfg.activeGroup.id), em);
     if (!record.coderResult.ok) {
@@ -190,7 +193,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
         // suffix internally — see runAuditPhases). Producer's audit-phase
         // session does NOT carry across iterations to keep argv small and
         // force a fresh look at the workspace.
-        const auditN = await runAuditPhases(reauditTask, opts.cfg, runId, iter, !!opts.smartDispatch, opts.verbose, /*record*/ undefined, /*persist*/ undefined, em);
+        const auditN = await runAuditPhases(reauditTask, opts.cfg, runId, iter, !!opts.smartDispatch, opts.verbose, /*record*/ undefined, /*persist*/ undefined, em, call);
 
         const iterEntry: NonNullable<RunRecord["loopIterations"]>[number] = {
           iteration: iter,
@@ -225,7 +228,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
           break;
         }
 
-        const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId, em);
+        const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId, em, call);
         iterEntry.coder = coderN;
         await persist();
         printCoderReport(coderN, iter, roleOf(coderId, opts.cfg.activeGroup.id), em);
@@ -328,6 +331,7 @@ async function runCoderPhase(
   iteration: number,
   coderAgentId: string,
   em: Emitter,
+  call: typeof callAgent,
 ): Promise<{ ok: boolean; reply: string; durationMs: number }> {
   const sessionKey = `agent:${coderAgentId}:${runId}:iter${iteration}`;
   const coderRole = roleOf(coderAgentId, cfg.activeGroup.id);
@@ -363,7 +367,7 @@ async function runCoderPhase(
   em.event({ type: "phase", phase: "coder", iteration, label: `5/5 Coder applying changes (iteration ${iteration})` });
   em.log("phase", `5/5 Coder applying changes (iteration ${iteration})`);
   const spin = em.spinner(`${coderRole} (iter ${iteration})`);
-  const r = await callAgent({
+  const r = await call({
     agentId: coderAgentId,
     sessionKey,
     message: body,
@@ -400,6 +404,7 @@ async function runAuditPhases(
   record: RunRecord | undefined,
   persist: (() => Promise<void>) | undefined,
   em: Emitter,
+  call: typeof callAgent,
 ): Promise<AuditPhaseResult> {
   const sessionTag = iteration === 1 ? runId : `${runId}:iter${iteration}`;
   const producerSession = `agent:${cfg.producerAgent}:${sessionTag}`;
@@ -431,7 +436,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   }
 
   const spin = em.spinner(`producer planning`);
-  const plan = await callAgent({
+  const plan = await call({
     agentId: cfg.producerAgent,
     sessionKey: producerSession,
     message: kickoff,
@@ -501,7 +506,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     em.warn("dispatch", `Producer returned 0 dispatches but task explicitly requires dispatch. Retrying with stronger nudge…`);
     const retryMsg = `You did NOT emit any DISPATCH blocks. The task above explicitly requires dispatching to specialists ("Dispatch in parallel to every relevant specialist"). The Smart Dispatch override is OFF, so you cannot answer inline. Re-read the task. Emit DISPATCH blocks now, one per specialist, in the exact format from your system prompt. Do not write any analysis or report — only the DISPATCH blocks. Available specialists: ${roster.join(", ")}.`;
     const spinR = em.spinner(`producer re-planning (forced dispatch)`);
-    const replan = await callAgent({
+    const replan = await call({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: retryMsg,
@@ -562,7 +567,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   // --- Phase 3: parallel specialist dispatch ---
   em.event({ type: "phase", phase: "dispatch", iteration, label: "2/4 specialists running in parallel" });
   em.log("phase", "2/4 specialists running in parallel");
-  const results = await runDispatchesInParallel(dispatches, sessionTag, cfg, verbose, iteration, em);
+  const results = await runDispatchesInParallel(dispatches, sessionTag, cfg, verbose, iteration, em, call);
   if (record) record.specialistResults = results.map(toSpecialistResult);
   if (persist) await persist();
 
@@ -596,7 +601,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     em.warn("dispatch", `skipping ${failResults.length} failed specialist(s): ${failResults.map(r => r.agent).join(", ")}`);
     const failNote = `Heads up before specialist replies arrive: ${failResults.length} specialist(s) failed and will be skipped — ${failResults.map(r => `${r.agent} (${(r.reply || "").split("\n")[0].slice(0, 120).replace(/\n/g, " ")})`).join("; ")}. When you integrate, note which specialists were unavailable; do not invent their findings.`;
     const spinN = em.spinner(`notifying producer of failures`);
-    const noteAck = await callAgent({
+    const noteAck = await call({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: failNote,
@@ -621,7 +626,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     }
 
     const spin2 = em.spinner(`producer acknowledging ${r.agent}`);
-    const ack = await callAgent({
+    const ack = await call({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: body,
@@ -660,7 +665,7 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     failedNoteForIntegrate;
 
   const spin3 = em.spinner("producer integrating");
-  const integration = await callAgent({
+  const integration = await call({
     agentId: cfg.producerAgent,
     sessionKey: producerSession,
     message: integratePrompt,
@@ -717,6 +722,7 @@ async function runDispatchesInParallel(
   verbose: boolean,
   iteration: number,
   em: Emitter,
+  call: typeof callAgent,
 ): Promise<DispatchResult[]> {
   // Run with bounded concurrency.
   const sem = new Semaphore(cfg.maxParallel);
@@ -735,7 +741,7 @@ async function runDispatchesInParallel(
 
     em.event({ type: "specialist_started", iteration, agent: role, label: d.task.slice(0, 80) });
     let spin = em.spinner(taskLabel);
-    let r = await callAgent({
+    let r = await call({
       agentId: qualifiedAgentId,
       sessionKey,
       message: msg,
@@ -755,7 +761,7 @@ async function runDispatchesInParallel(
       em.warn("dispatch", `${role} timed out at ${(r.durationMs/1000).toFixed(0)}s. Retrying once with ${bumpedTimeout}s budget…`);
       const resumeMsg = `Continue your prior reply. You were interrupted by timeout. If you'd already produced your DELIVERABLE, repeat it; if you were mid-investigation, finish and produce the DELIVERABLE now.`;
       spin = em.spinner(`${taskLabel} (retry)`);
-      r = await callAgent({
+      r = await call({
         agentId: qualifiedAgentId,
         sessionKey,
         message: resumeMsg,

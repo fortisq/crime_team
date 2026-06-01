@@ -5,8 +5,10 @@
 // against the group's Producer, and writes the finalAnswer back to the JSON.
 //
 // Usage:
-//   node scripts/salvage-integrate.mjs <runId>
-//   e.g.  node scripts/salvage-integrate.mjs team-1780122162
+//   node scripts/salvage-integrate.mjs <runId> [--thinking <off|low|medium|high|max>] [--producer <agentId>]
+//   e.g.  node scripts/salvage-integrate.mjs team-1780122162 --thinking max
+//   (--thinking defaults to "high"; --producer overrides the group's Producer,
+//    e.g. after a model swap.)
 //
 // Prereqs:
 //   - You're in the orchestrator project root
@@ -18,12 +20,24 @@ import { readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-const runId = process.argv[2];
+// Parse: <runId> [--thinking <level>] [--producer <agentId>]
+let runId, cliThinking, cliProducer;
+{
+  const a = process.argv.slice(2);
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === "--thinking") cliThinking = a[++i];
+    else if (a[i] === "--producer") cliProducer = a[++i];
+    else if (!runId) runId = a[i];
+  }
+}
 if (!runId) {
-  console.error("usage: node scripts/salvage-integrate.mjs <runId>");
-  console.error("  e.g.  node scripts/salvage-integrate.mjs team-1780122162");
+  console.error("usage: node scripts/salvage-integrate.mjs <runId> [--thinking <off|low|medium|high|max>] [--producer <agentId>]");
+  console.error("  e.g.  node scripts/salvage-integrate.mjs team-1780122162 --thinking max");
   process.exit(2);
 }
+// thinking defaults to "high" (the historical behavior); --producer overrides the
+// group's Producer (e.g. after a model swap).
+const thinkingLevel = cliThinking || "high";
 
 // Locate the run record by scanning runs/<group>/<runId>.json
 const runsRoot = join(process.cwd(), "runs");
@@ -63,7 +77,7 @@ if (!group) {
   console.error(`[salvage] group '${groupId}' not in ~/.crime-team/groups.json`);
   process.exit(2);
 }
-const producerAgentId = group.producerAgentId;
+const producerAgentId = cliProducer || group.producerAgentId;
 const operator = groups.operatorName || "the operator";
 const sessionKey = `agent:${producerAgentId}:${runId}-salvage`;
 console.log(`[salvage] producer:   ${producerAgentId}`);
@@ -109,7 +123,7 @@ function callAgent({ agentId, message, timeoutSec = 1800, thinkingLevel }) {
   if (failReplies.length > 0) {
     const note = `Heads up before specialist replies arrive: ${failReplies.length} specialist(s) failed in the original run and are skipped — ${failReplies.map(r => r.agent).join(", ")}. When you integrate, note which were unavailable; do not invent their findings.`;
     console.log(`[salvage] notifying producer of failures…`);
-    const r = await callAgent({ agentId: producerAgentId, message: note, thinkingLevel: "high" });
+    const r = await callAgent({ agentId: producerAgentId, message: note, thinkingLevel });
     console.log(`[salvage]   ${r.ok ? "ok" : "fail"}`);
   }
 
@@ -122,7 +136,7 @@ function callAgent({ agentId, message, timeoutSec = 1800, thinkingLevel }) {
       body = body.slice(0, trunc) + `\n\n[…truncated by salvage at ${trunc} chars; full was ${reply.reply.length}…]`;
     }
     const start = Date.now();
-    const ack = await callAgent({ agentId: producerAgentId, message: body, thinkingLevel: "high" });
+    const ack = await callAgent({ agentId: producerAgentId, message: body, thinkingLevel });
     console.log(`[salvage]   ${ack.ok ? "ok" : "fail"} in ${((Date.now() - start)/1000).toFixed(1)}s`);
     if (!ack.ok) {
       console.error(`[salvage] producer failed to ack ${reply.agent}:`);
@@ -142,7 +156,7 @@ function callAgent({ agentId, message, timeoutSec = 1800, thinkingLevel }) {
 
   console.log(`[salvage] integrating…`);
   const start = Date.now();
-  const integration = await callAgent({ agentId: producerAgentId, message: integratePrompt, thinkingLevel: "high" });
+  const integration = await callAgent({ agentId: producerAgentId, message: integratePrompt, thinkingLevel });
   console.log(`[salvage] integration ${integration.ok ? "ok" : "fail"} in ${((Date.now() - start)/1000).toFixed(1)}s`);
 
   if (!integration.ok) {

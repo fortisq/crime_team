@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-06-01 — orchestration integration tests + salvage flags + copyable history runIds (FOLLOWUPS E1/E5/E7)
+
+- **E1 — integration tests for `orchestrate()`.** Added an injectable `call` to `OrchestratorOpts` (threaded through the audit helpers; defaults to the real `callAgent`) so the full flow is testable without spawning openclaw. `test/orchestrate.test.mjs` exercises the paths the audit flagged: inline answer (`dispatchMode: "inline"`), parallel dispatch + integrate (2 specialists → integrated answer), retry-on-timeout (a specialist returns exitCode −1, is retried once, recorded `retried: true`), and all-specialists-failed (exit 1, `failurePhase: "all-specialists-failed"`) — each asserting the persisted RunRecord. `npm test` → 33.
+- **E5 — salvage flags.** `scripts/salvage-integrate.mjs` gained `--thinking <level>` (defaults to "high") and `--producer <agentId>` (overrides the group's Producer, e.g. after a model swap) instead of hardcoding `thinking:"high"`.
+- **E7 — copyable history runIds.** Each run in the history sidebar now has a click-to-copy runId (`stopPropagation` so it doesn't trigger the row's load), matching the active-run runId chip.
+
 ## 2026-06-01 — cap per-line buffering in the stream pumps (FOLLOWUPS A3)
 
 The stdout/stderr pumps used `BufReader::lines()`/`next_line()`, which read to `\n` with no cap — a pathological multi-MB no-newline blob (a binary dump, a runaway log) would accumulate into one unbounded `String` and then flush to the webview in a single shot.

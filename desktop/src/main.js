@@ -625,11 +625,22 @@ async function refreshRuns() {
       div.innerHTML = `
         <div class="task">${escapeHtml(r.task)}</div>
         <div class="meta">
-          <span>${r.runId}</span>
+          <span class="run-id-copy" title="click to copy runId">${r.runId}</span>
           <span>${r.hasFinal ? '<span class="done-dot">●</span>' : '<span class="pending-dot">●</span>'}</span>
         </div>
       `;
       div.addEventListener("click", () => loadRun(r.runId, div));
+      // Click-to-copy the runId without triggering the row's loadRun.
+      const idEl = div.querySelector(".run-id-copy");
+      idEl?.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(r.runId);
+          const prev = idEl.textContent;
+          idEl.textContent = "copied!";
+          setTimeout(() => { idEl.textContent = prev; }, 900);
+        } catch {}
+      });
       els.runsList.appendChild(div);
     }
   } catch (e) {
