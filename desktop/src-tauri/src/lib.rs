@@ -28,6 +28,14 @@ struct RunState {
     current_group_id: Mutex<Option<String>>,
 }
 
+/// Lock a mutex tolerating poisoning. A panic while another thread holds the
+/// lock would otherwise poison it and make every later `.lock().unwrap()` panic
+/// — taking down the whole Tauri process. Every RunState mutation is a single
+/// atomic assign/take, so recovering the inner value is always safe.
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RunLine {
@@ -41,6 +49,36 @@ struct RunLine {
 struct RunDone {
     run_id: String,
     exit_code: Option<i32>,
+    /// Set when the orchestrator process couldn't be waited on (internal error,
+    /// distinct from a user cancel which leaves both this and exit_code None).
+    wait_error: Option<String>,
+}
+
+/// A surfaced non-fatal failure from a config-mutation command (gateway
+/// restart, auth copy, identity, etc.) that used to be silently discarded with
+/// `let _ =`. The GUI shows it as a banner so "saved" doesn't hide a partial.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OpWarning {
+    op: String,
+    detail: String,
+    fatal: bool,
+}
+
+fn emit_warn(app: &AppHandle, op: impl Into<String>, detail: impl Into<String>) {
+    let _ = app.emit("op:warning", OpWarning { op: op.into(), detail: detail.into(), fatal: false });
+}
+
+/// Sentinel that prefixes one NDJSON event line on the orchestrator's stdout
+/// (must match EVENT_SENTINEL in src/events.ts).
+const EVENT_SENTINEL: &str = "@@CTEVT@@ ";
+
+/// Record (rate-limited) that an event failed to reach the frontend.
+fn note_drop(drops: &std::sync::atomic::AtomicU64) {
+    let n = drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        eprintln!("[ct] dropped {n} orchestrator event(s) — frontend gone?");
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,7 +130,7 @@ async fn run_task(
     // current_run_id slots and orphan the first orchestrator (uncancelable).
     // The UI normally guards this, but `cancel` re-enables Run while the old
     // process may still be winding down.
-    if state.child.lock().unwrap().is_some() {
+    if lock_ok(&state.child).is_some() {
         return Err("a run is already in progress — cancel it first".into());
     }
 
@@ -135,46 +173,61 @@ async fn run_task(
     // G.3 — stash the runId + active group id so cancel_run_soft can write
     // the marker file the orchestrator polls between loop iterations.
     {
-        let mut slot = state.child.lock().unwrap();
+        let mut slot = lock_ok(&state.child);
         *slot = Some(child);
     }
     {
-        let mut id_slot = state.current_run_id.lock().unwrap();
+        let mut id_slot = lock_ok(&state.current_run_id);
         *id_slot = Some(run_id.clone());
     }
     if let Ok(gid) = active_group_id_for_state() {
-        let mut g_slot = state.current_group_id.lock().unwrap();
+        let mut g_slot = lock_ok(&state.current_group_id);
         *g_slot = Some(gid);
     }
 
-    // stdout pump
+    // Shared counter so a frontend that vanished mid-run leaves a trace instead
+    // of silently dropping events (the done emit below is the one that un-sticks
+    // the UI; its loss is logged unconditionally).
+    let drop_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // stdout pump — split the structured NDJSON event stream (sentinel-prefixed)
+    // from human log lines. Events go out as `orchestrator:event` (raw JSON the
+    // GUI owns the schema of); everything else stays `orchestrator:line` for the
+    // log panel. A malformed sentinel line falls through to the human log.
     {
         let app_out = app.clone();
         let id = run_id_emit.clone();
+        let drops = drop_count.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = app_out.emit("orchestrator:line", RunLine {
-                    run_id: id.clone(),
-                    stream: "stdout",
-                    line,
-                });
+                if let Some(rest) = line.strip_prefix(EVENT_SENTINEL) {
+                    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(rest) {
+                        if let Some(o) = v.as_object_mut() {
+                            o.entry("runId").or_insert_with(|| serde_json::Value::String(id.clone()));
+                        }
+                        if app_out.emit("orchestrator:event", v).is_err() { note_drop(&drops); }
+                        continue;
+                    }
+                }
+                if app_out.emit("orchestrator:line", RunLine {
+                    run_id: id.clone(), stream: "stdout", line,
+                }).is_err() { note_drop(&drops); }
             }
         });
     }
 
-    // stderr pump
+    // stderr pump (line-only; openclaw/clampThinking noise lands in the log)
     {
         let app_err = app.clone();
         let id = run_id_emit.clone();
+        let drops = drop_count.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = app_err.emit("orchestrator:line", RunLine {
-                    run_id: id.clone(),
-                    stream: "stderr",
-                    line,
-                });
+                if app_err.emit("orchestrator:line", RunLine {
+                    run_id: id.clone(), stream: "stderr", line,
+                }).is_err() { note_drop(&drops); }
             }
         });
     }
@@ -188,30 +241,37 @@ async fn run_task(
         // guard, then await. This avoids holding a non-Send std::sync::Mutex
         // guard across the await point.
         let c_opt: Option<Child> = {
-            let mut slot = state_done.child.lock().unwrap();
+            let mut slot = lock_ok(&state_done.child);
             slot.take()
         };
-        let exit_code: Option<i32> = if let Some(mut c) = c_opt {
+        // wait() failing is an INTERNAL error (process handle I/O), distinct
+        // from a user cancel — both leave exit_code None, so carry a
+        // wait_error to tell them apart in the UI ("error" vs "stopped").
+        let (exit_code, wait_error): (Option<i32>, Option<String>) = if let Some(mut c) = c_opt {
             match c.wait().await {
-                Ok(status) => status.code(),
-                Err(_) => None,
+                Ok(status) => (status.code(), None),
+                Err(e) => (None, Some(format!("wait failed: {e}"))),
             }
         } else {
-            None
+            (None, None)
         };
         // G.3 — clear current_run_id + current_group_id now that the run is done.
         {
-            let mut s = state_done.current_run_id.lock().unwrap();
+            let mut s = lock_ok(&state_done.current_run_id);
             *s = None;
         }
         {
-            let mut s = state_done.current_group_id.lock().unwrap();
+            let mut s = lock_ok(&state_done.current_group_id);
             *s = None;
         }
-        let _ = app_done.emit("orchestrator:done", RunDone {
+        // The done event un-sticks the UI — always log if it's lost.
+        if app_done.emit("orchestrator:done", RunDone {
             run_id: id_done,
             exit_code,
-        });
+            wait_error,
+        }).is_err() {
+            eprintln!("[ct] orchestrator:done emit failed (exit_code={exit_code:?}) — frontend may hang");
+        }
     });
 
     Ok(run_id)
@@ -219,7 +279,7 @@ async fn run_task(
 
 #[tauri::command]
 async fn cancel_run(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
-    let mut slot = state.child.lock().unwrap();
+    let mut slot = lock_ok(&state.child);
     if let Some(mut c) = slot.take() {
         let _ = c.start_kill();
         return Ok(true);
@@ -237,8 +297,8 @@ async fn cancel_run(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
 #[tauri::command]
 async fn cancel_run_soft(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
     let (run_id, group_id) = {
-        let r = state.current_run_id.lock().unwrap().clone();
-        let g = state.current_group_id.lock().unwrap().clone();
+        let r = lock_ok(&state.current_run_id).clone();
+        let g = lock_ok(&state.current_group_id).clone();
         (r, g)
     };
     let (Some(run_id), Some(group_id)) = (run_id, group_id) else {
@@ -849,7 +909,9 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
 
         // Mirror auth profiles
         let auth_dest = agent_dir.join("auth-profiles.json");
-        let _ = std::fs::copy(&auth_src, &auth_dest);
+        if let Err(e) = std::fs::copy(&auth_src, &auth_dest) {
+            emit_warn(&app, "auth copy", format!("{qid}: {e} (agent may have no credentials)"));
+        }
 
         // Write system prompt file
         let prompt_file = prompts_root.join(format!("{}.{}.md", spec.id, role));
@@ -861,12 +923,14 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
 
         // Set identity (display name + emoji)
         let display = if role == "producer" { "Producer".to_string() } else { capitalize(&role) };
-        let _ = run_openclaw(&[
+        if let Err(e) = run_openclaw(&[
             "agents", "set-identity",
             "--agent", &qid,
             "--name", &display,
             "--emoji", &agent_spec.emoji,
-        ], None).await;
+        ], None).await {
+            emit_warn(&app, "set identity", format!("{qid}: {e}"));
+        }
     }
 
     // ─── 3. patch agents.list ─────────────────────────────────────────────
@@ -968,7 +1032,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
 
     // ─── 7. restart gateway ──────────────────────────────────────────────────
     emit_scan(&app, "restarting", "restarting gateway…");
-    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
 
     emit_scan(&app, "done", format!("group '{}' created", spec.id));
     Ok(new_group)
@@ -1058,6 +1122,7 @@ async fn groups_set_prompt(agent_id: String, prompt: String) -> Result<(), Strin
 /// inside openclaw.json so they point at the new project root.
 #[tauri::command]
 async fn groups_edit(
+    app: AppHandle,
     group_id: String,
     display_name: Option<String>,
     emoji: Option<String>,
@@ -1102,7 +1167,7 @@ async fn groups_edit(
             let payload = serde_json::json!({ "agents": { "list": list } });
             let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
             run_openclaw(&["config", "patch", "--stdin", "--replace-path", "agents.list"], Some(payload_s.as_bytes())).await?;
-            let _ = run_openclaw(&["gateway", "restart"], None).await;
+            if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
         }
     }
     Ok(updated)
@@ -1113,7 +1178,7 @@ async fn groups_edit(
 /// remove from groups.json. If the active group is being removed, switch to
 /// another group (or refuse if it's the last one).
 #[tauri::command]
-async fn groups_remove(group_id: String) -> Result<(), String> {
+async fn groups_remove(app: AppHandle, group_id: String) -> Result<(), String> {
     let mut file = read_groups_file()?;
     let idx = file.groups.iter().position(|g| g.id == group_id)
         .ok_or_else(|| format!("group '{group_id}' not found"))?;
@@ -1208,7 +1273,7 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
             map.remove(&group.id);
         }
     }
-    let _ = write_crime_team_json(&ct);
+    if let Err(e) = write_crime_team_json(&ct) { emit_warn(&app, "save thinking config", e); }
 
     file.groups.remove(idx);
     if file.active_group_id == group_id {
@@ -1216,7 +1281,7 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
         file.groups[0].last_used_at = chrono_now_iso();
     }
     write_groups_file(&file)?;
-    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
     Ok(())
 }
 
@@ -1232,7 +1297,7 @@ async fn groups_remove(group_id: String) -> Result<(), String> {
 /// existing workspace, dotted-id rename, systemPromptOverride wire-up, auth
 /// mirror, team-prompt file, append to group's specialists, restart gateway.
 #[tauri::command]
-async fn groups_add_specialist(group_id: String, mut spec: AgentSpec) -> Result<Group, String> {
+async fn groups_add_specialist(app: AppHandle, group_id: String, mut spec: AgentSpec) -> Result<Group, String> {
     // 0. G.1 — Coder kind branch. Apply defense-in-depth mutations BEFORE
     //    the generic validation so a sloppy caller still ends up with a
     //    well-formed Coder agent.
@@ -1330,17 +1395,21 @@ async fn groups_add_specialist(group_id: String, mut spec: AgentSpec) -> Result<
 
     // Mirror auth profiles (now that agent_dir definitely exists) + write
     // team-prompt + set identity.
-    let _ = std::fs::copy(&auth_src, agent_dir.join("auth-profiles.json"));
+    if let Err(e) = std::fs::copy(&auth_src, agent_dir.join("auth-profiles.json")) {
+        emit_warn(&app, "auth copy", format!("{qualified_id}: {e} (agent may have no credentials)"));
+    }
     let prompt_file = prompts_root.join(format!("{}.{}.md", group.id, spec.id));
     if let Err(e) = std::fs::write(&prompt_file, &spec.system_prompt) {
         return Err(format!("write prompt {prompt_file:?}: {e}"));
     }
-    let _ = run_openclaw(&[
+    if let Err(e) = run_openclaw(&[
         "agents", "set-identity",
         "--agent", &qualified_id,
         "--name", &capitalize(&spec.id),
         "--emoji", &spec.emoji,
-    ], None).await;
+    ], None).await {
+        emit_warn(&app, "set identity", format!("{qualified_id}: {e}"));
+    }
 
     // 4. Dotted-id rename + systemPromptOverride wiring in agents.list
     let list_json = run_openclaw(&["config", "get", "agents.list"], None).await
@@ -1388,10 +1457,10 @@ async fn groups_add_specialist(group_id: String, mut spec: AgentSpec) -> Result<
             .entry(group.id.clone()).or_insert_with(|| serde_json::json!({}));
         role_map_entry.as_object_mut().unwrap()
             .insert(spec.id.clone(), serde_json::Value::String(spec.thinking.clone()));
-        let _ = write_crime_team_json(&ct);
+        if let Err(e) = write_crime_team_json(&ct) { emit_warn(&app, "save thinking config", e); }
     }
 
-    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
     Ok(file.groups[idx].clone())
 }
 
@@ -1401,6 +1470,7 @@ async fn groups_add_specialist(group_id: String, mut spec: AgentSpec) -> Result<
 /// (perGroupThinking entry). Restarts gateway. Does NOT touch the workspace.
 #[tauri::command]
 async fn groups_rename_specialist(
+    app: AppHandle,
     group_id: String,
     old_role: String,
     new_role: String,
@@ -1460,7 +1530,11 @@ async fn groups_rename_specialist(
     let old_prompt = prompts_root.join(format!("{}.{}.md", group.id, old_role));
     let new_prompt = prompts_root.join(format!("{}.{}.md", group.id, new_role));
     if old_prompt.exists() {
-        let _ = std::fs::rename(&old_prompt, &new_prompt);
+        // Propagate: if this fails the specialist is renamed in config but its
+        // prompt file keeps the old name — a half-state where groups_get_prompt
+        // later fails and the agent loses its prompt override. Fail loudly.
+        std::fs::rename(&old_prompt, &new_prompt)
+            .map_err(|e| format!("rename prompt file {old_prompt:?} → {new_prompt:?}: {e}"))?;
     }
 
     // 3. Patch openclaw.json — update id + agentDir + (optional) name field
@@ -1510,9 +1584,9 @@ async fn groups_rename_specialist(
             }
         }
     }
-    let _ = write_crime_team_json(&ct);
+    if let Err(e) = write_crime_team_json(&ct) { emit_warn(&app, "save thinking config", e); }
 
-    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
     Ok(file.groups[idx].clone())
 }
 
@@ -1869,7 +1943,7 @@ Return ONLY the polished task prompt — no preamble, no explanation, no markdow
 /// agent's home dir under ~/.openclaw/agents/<id>/ (auth + sessions). The
 /// workspace path is never touched.
 #[tauri::command]
-async fn groups_remove_specialist(group_id: String, role: String) -> Result<Group, String> {
+async fn groups_remove_specialist(app: AppHandle, group_id: String, role: String) -> Result<Group, String> {
     let mut file = read_groups_file()?;
     let idx = file.groups.iter().position(|g| g.id == group_id)
         .ok_or_else(|| format!("group '{group_id}' not found"))?;
@@ -1937,9 +2011,9 @@ async fn groups_remove_specialist(group_id: String, role: String) -> Result<Grou
             }
         }
     }
-    let _ = write_crime_team_json(&ct);
+    if let Err(e) = write_crime_team_json(&ct) { emit_warn(&app, "save thinking config", e); }
 
-    let _ = run_openclaw(&["gateway", "restart"], None).await;
+    if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
     Ok(file.groups[idx].clone())
 }
 

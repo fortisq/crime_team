@@ -115,11 +115,18 @@ export function loadConfig(): Config {
   }
 
   // .crime-team.json user overrides (perGroupThinking, perAgent, etc.)
+  // A MISSING file is fine (defaults apply); a PRESENT-but-malformed file is
+  // not — silently falling back to defaults meant a typo'd config ran with the
+  // wrong timeouts/thinking and no signal. Fail loud on parse errors.
   let userOverrides: Partial<Config> = {};
   try {
     const raw = readFileSync(join(process.cwd(), ".crime-team.json"), "utf8");
     userOverrides = JSON.parse(raw) as Partial<Config>;
-  } catch {}
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error(`.crime-team.json is present but invalid: ${(e as Error).message}`);
+    }
+  }
 
   const cfg: Config = {
     producerAgent: group.producerAgentId,

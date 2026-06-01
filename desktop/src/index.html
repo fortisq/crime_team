@@ -76,11 +76,16 @@
           </div>
         </section>
 
+        <div id="appBanner" class="app-banner hidden" role="alert">
+          <span id="appBannerText"></span>
+          <button id="appBannerClose" class="ghost small" type="button" aria-label="dismiss">✕</button>
+        </div>
+
         <section class="status hidden" id="statusSection">
           <div class="status-header">
             <span id="phaseLabel" class="phase">idle</span>
             <span id="elapsedTotal" class="muted"></span>
-            <span id="runIdLabel" class="muted right"></span>
+            <button id="runIdLabel" class="run-id-chip muted" type="button"></button>
           </div>
           <div class="agents" id="agents"></div>
         </section>

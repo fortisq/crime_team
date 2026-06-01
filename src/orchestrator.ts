@@ -10,14 +10,17 @@ import chalk from "chalk";
 import { callAgent, MAX_ARGV_CHARS } from "./agent.js";
 import { parseDispatches, formatDispatchMessage } from "./dispatch.js";
 import { type Config, timeoutFor, thinkingFor, fullyQualify, roleOf, auditSpecialists } from "./config.js";
-import type { DispatchBlock, RunRecord } from "./types.js";
+import type { DispatchBlock, DispatchMode, RunRecord, SpecialistResult } from "./types.js";
 import { parseCitations, verifyCitations, formatVerificationReport } from "./citations.js";
+import { createEmitter, type Emitter } from "./events.js";
 
 export interface OrchestratorOpts {
   task: string;
   cfg: Config;
-  /** Optional pre-existing runId (resume). */
+  /** Optional pre-existing runId (resume / GUI-pinned). */
   runId?: string;
+  /** Emit machine-readable NDJSON events only (suppress human log + spinner). */
+  json?: boolean;
   verbose: boolean;
   /**
    * When true, Producer judges which specialists are actually needed instead
@@ -45,15 +48,23 @@ export interface OrchestratorOpts {
 interface AuditPhaseResult {
   producerPlan: string;
   dispatches: DispatchBlock[];
-  specialistResults: { agent: string; reply: string; ok: boolean }[];
+  specialistResults: SpecialistResult[];
   integrated: string;
   noFindings: boolean;
+  dispatchMode?: DispatchMode;
+  failurePhase?: string;
+  failureReason?: string;
   /** non-zero = bail (no integration to consume) */
   exitCode: number;
 }
 
 export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
-  const runId = opts.runId ?? `team-${Math.floor(Date.now() / 1000)}`;
+  // Millisecond base36 + random suffix: second-precision ids collided when two
+  // runs launched in the same wall-clock second (overwriting each other's
+  // record). A caller-pinned id (GUI UUID / --resume) still wins.
+  const runId = opts.runId
+    ?? `team-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const em = createEmitter(runId, !!opts.json);
   const record: RunRecord = {
     runId,
     startedAt: new Date().toISOString(),
@@ -65,27 +76,53 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
   await mkdir(opts.cfg.runsDir, { recursive: true });
   const recordPath = join(opts.cfg.runsDir, `${runId}.json`);
   const markerPath = join(opts.cfg.runsDir, `${runId}.cancel`);
-  const persist = async () => writeFile(recordPath, JSON.stringify(record, null, 2));
+  // Guarded: a disk error (ENOSPC/EACCES) during a long run must not crash the
+  // orchestrator — losing a mid-run checkpoint beats aborting the whole run.
+  const persist = async () => {
+    try { await writeFile(recordPath, JSON.stringify(record, null, 2)); }
+    catch (e) {
+      em.event({ type: "error", phase: "persist", fatal: false,
+        msg: `checkpoint write failed: ${(e as Error).message}` });
+    }
+  };
 
-  log("info", `runId=${runId}`);
-  log("info", `record at ${recordPath}`);
+  const tRunStart = Date.now();
+  const emitDone = (ok: boolean, exitCode: number) =>
+    em.event({ type: "done", ok, exitCode, totalMs: Date.now() - tRunStart,
+      failurePhase: record.failurePhase, failureReason: record.failureReason });
+
+  em.event({
+    type: "run_started", task: opts.task, group: opts.cfg.activeGroup.id,
+    producer: opts.cfg.producerAgent, useCoder: !!opts.useCoder,
+    loopMax: opts.loopMax ?? 1, smartDispatch: !!opts.smartDispatch,
+  });
+  em.log("info", `runId=${runId}`);
+  em.log("info", `record at ${recordPath}`);
+  // Make a silently-disabled citation check observable: an empty workspace
+  // means the hallucination guard never runs, so a clean run record is NOT
+  // evidence citations were verified — it's evidence they weren't checked.
+  if (!opts.cfg.disableCitationCheck && !opts.cfg.workspace) {
+    record.citationCheckSkippedReason = "no-workspace";
+    em.warn("citation", "citation verification disabled — no workspace resolved (group.workspace empty and OpenClaw autodetect failed)");
+  }
   // Write the initial record immediately so the run is visible in the GUI's
   // sidebar even if the orchestrator (or its parent process) is killed before
   // Producer's first reply lands.
   await persist();
 
-  const tRunStart = Date.now();
-
   // try/finally — always sweep the soft-cancel marker on the way out, no
   // matter how we exit (success / error / soft-cancel / hard kill mid-finally).
   try {
     // --- Iteration 1: audit + (optionally) Coder ---
-    const iter1 = await runAuditPhases(opts.task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist);
+    const iter1 = await runAuditPhases(opts.task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist, em);
     // runAuditPhases mutates record's top-level audit fields (producerPlan,
     // dispatches, specialistResults, finalAnswer) for iteration 1.
     if (iter1.exitCode !== 0) {
+      record.failurePhase = iter1.failurePhase;
+      record.failureReason = iter1.failureReason;
       record.endedAt = new Date().toISOString();
       await persist();
+      emitDone(false, iter1.exitCode);
       return iter1.exitCode;
     }
 
@@ -94,37 +131,43 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       record.endedAt = new Date().toISOString();
       await persist();
       const totalSec = ((Date.now() - tRunStart) / 1000).toFixed(1);
-      log("ok", `done. runId=${runId}. total ${totalSec}s.`);
+      em.log("ok", `done. runId=${runId}. total ${totalSec}s.`);
+      emitDone(true, 0);
       return 0;
     }
 
     // G.2 — Phase 5: Coder applies the audit's findings.
     const coderId = opts.cfg.activeGroup.coderAgentId;
     if (!coderId) {
-      log("error", "useCoder=true but active group has no coderAgentId — refusing");
+      record.failurePhase = "coder-config";
+      record.failureReason = "useCoder=true but active group has no coderAgentId";
+      em.error("coder", "useCoder=true but active group has no coderAgentId — refusing");
       record.coderResult = { ok: false, reply: "[orchestrator] useCoder=true but group has no coderAgentId", durationMs: 0 };
       record.endedAt = new Date().toISOString();
       await persist();
+      emitDone(false, 1);
       return 1;
     }
 
     if (checkSoftCancel(markerPath)) {
-      log("warn", "soft-cancel detected before Coder phase — exiting cleanly");
+      em.warn("cancel", "soft-cancel detected before Coder phase — exiting cleanly");
       record.loopSoftCancelled = true;
       record.endedAt = new Date().toISOString();
       await persist();
+      emitDone(true, 0);
       return 0;
     }
 
-    record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId);
+    record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId, em);
     await persist();
-    printCoderReport(record.coderResult, 1, opts.cfg.activeGroup.coderAgentId
-      ? roleOf(opts.cfg.activeGroup.coderAgentId, opts.cfg.activeGroup.id)
-      : "coder");
+    printCoderReport(record.coderResult, 1, roleOf(coderId, opts.cfg.activeGroup.id), em);
     if (!record.coderResult.ok) {
-      log("warn", "Coder failed; skipping any loop iterations");
+      record.failurePhase = "coder";
+      record.failureReason = record.coderResult.reply.split("\n")[0]?.slice(0, 200);
+      em.warn("coder", "Coder failed; skipping any loop iterations");
       record.endedAt = new Date().toISOString();
       await persist();
+      emitDone(false, 1);
       return 1;
     }
 
@@ -135,18 +178,19 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       record.loopIterations = [];
       for (let iter = 2; iter <= loopMax; iter++) {
         if (checkSoftCancel(markerPath)) {
-          log("warn", `soft-cancel detected before iteration ${iter} — exiting cleanly`);
+          em.warn("cancel", `soft-cancel detected before iteration ${iter} — exiting cleanly`);
           record.loopSoftCancelled = true;
           break;
         }
 
-        log("phase", `iter ${iter}/${loopMax} re-auditing changes`);
+        em.event({ type: "phase", phase: "reaudit", iteration: iter, label: `iter ${iter}/${loopMax} re-auditing changes` });
+        em.log("phase", `iter ${iter}/${loopMax} re-auditing changes`);
         const reauditTask = buildReauditTask(opts.task, lastCoderReply);
         // Fresh session keys per iteration (the runId carries an :iter${N}
         // suffix internally — see runAuditPhases). Producer's audit-phase
         // session does NOT carry across iterations to keep argv small and
         // force a fresh look at the workspace.
-        const auditN = await runAuditPhases(reauditTask, opts.cfg, runId, iter, !!opts.smartDispatch, opts.verbose, /*record*/ undefined, /*persist*/ undefined);
+        const auditN = await runAuditPhases(reauditTask, opts.cfg, runId, iter, !!opts.smartDispatch, opts.verbose, /*record*/ undefined, /*persist*/ undefined, em);
 
         const iterEntry: NonNullable<RunRecord["loopIterations"]>[number] = {
           iteration: iter,
@@ -162,30 +206,35 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
         await persist();
 
         if (auditN.exitCode !== 0) {
-          log("warn", `iter ${iter} audit failed; stopping loop`);
+          iterEntry.status = "audit-failed";
+          em.warn("loop", `iter ${iter} audit failed; stopping loop`);
           break;
         }
 
         if (auditN.noFindings) {
-          log("ok", `loop stopped early — iter ${iter} returned AUDIT CLEAN sentinel`);
+          iterEntry.status = "clean-sentinel";
+          em.log("ok", `loop stopped early — iter ${iter} returned AUDIT CLEAN sentinel`);
           record.loopStoppedClean = true;
           break;
         }
 
         if (checkSoftCancel(markerPath)) {
-          log("warn", `soft-cancel detected after iter ${iter} audit — exiting cleanly`);
+          iterEntry.status = "soft-cancelled";
+          em.warn("cancel", `soft-cancel detected after iter ${iter} audit — exiting cleanly`);
           record.loopSoftCancelled = true;
           break;
         }
 
-        const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId);
+        const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId, em);
         iterEntry.coder = coderN;
         await persist();
-        printCoderReport(coderN, iter, roleOf(coderId, opts.cfg.activeGroup.id));
+        printCoderReport(coderN, iter, roleOf(coderId, opts.cfg.activeGroup.id), em);
         if (!coderN.ok) {
-          log("warn", `iter ${iter} Coder failed; stopping loop`);
+          iterEntry.status = "coder-failed";
+          em.warn("coder", `iter ${iter} Coder failed; stopping loop`);
           break;
         }
+        iterEntry.status = "completed";
         lastCoderReply = coderN.reply;
       }
     }
@@ -193,7 +242,8 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
     record.endedAt = new Date().toISOString();
     await persist();
     const totalSec = ((Date.now() - tRunStart) / 1000).toFixed(1);
-    log("ok", `done. runId=${runId}. total ${totalSec}s.`);
+    em.log("ok", `done. runId=${runId}. total ${totalSec}s.`);
+    emitDone(true, 0);
     return 0;
   } finally {
     // Always sweep the soft-cancel marker, even on hard kill exits we never
@@ -277,6 +327,7 @@ async function runCoderPhase(
   runId: string,
   iteration: number,
   coderAgentId: string,
+  em: Emitter,
 ): Promise<{ ok: boolean; reply: string; durationMs: number }> {
   const sessionKey = `agent:${coderAgentId}:${runId}:iter${iteration}`;
   const coderRole = roleOf(coderAgentId, cfg.activeGroup.id);
@@ -309,19 +360,23 @@ async function runCoderPhase(
     body = body.slice(0, trunc) + `\n\n[…coder kickoff truncated by orchestrator at ${trunc} chars…]`;
   }
 
-  log("phase", `5/5 Coder applying changes (iteration ${iteration})`);
-  const spin = startSpinner(`${coderRole} (iter ${iteration})`);
+  em.event({ type: "phase", phase: "coder", iteration, label: `5/5 Coder applying changes (iteration ${iteration})` });
+  em.log("phase", `5/5 Coder applying changes (iteration ${iteration})`);
+  const spin = em.spinner(`${coderRole} (iter ${iteration})`);
   const r = await callAgent({
     agentId: coderAgentId,
     sessionKey,
     message: body,
     timeoutSec: timeoutFor(cfg, coderAgentId),
     thinkingLevel: thinkingFor(cfg, coderAgentId),
+    onWarn: (m) => em.warn("agent", m),
   });
   spin.stop(r.ok ? "ok" : "fail", r.durationMs);
+  if (r.stderr) em.warn("coder", `${coderRole} stderr: ${r.stderr.split("\n")[0].slice(0, 160)}`);
   if (!r.ok) {
-    log("warn", `Coder failed (iter ${iteration}): ${r.text.split("\n")[0]}`);
+    em.warn("coder", `Coder failed (iter ${iteration}): ${r.text.split("\n")[0]}`);
   }
+  em.event({ type: "coder", iteration, ok: r.ok, durationMs: r.durationMs, role: coderRole });
   return { ok: r.ok, reply: r.text, durationMs: r.durationMs };
 }
 
@@ -344,12 +399,16 @@ async function runAuditPhases(
   verbose: boolean,
   record: RunRecord | undefined,
   persist: (() => Promise<void>) | undefined,
+  em: Emitter,
 ): Promise<AuditPhaseResult> {
   const sessionTag = iteration === 1 ? runId : `${runId}:iter${iteration}`;
   const producerSession = `agent:${cfg.producerAgent}:${sessionTag}`;
+  const onWarn = (m: string) => em.warn("agent", m);
+  let dispatchMode: DispatchMode = "parallel";
 
   // --- Phase 1: Producer plans ---
-  log("phase", "1/4 Producer planning");
+  em.event({ type: "phase", phase: "plan", iteration, label: "1/4 Producer planning" });
+  em.log("phase", "1/4 Producer planning");
   // Pin the AUDIT roster (Coder excluded) into the kickoff so smaller models
   // can't hallucinate stock role names AND can't dispatch to the Coder.
   const roster = auditSpecialists(cfg).map(id => roleOf(id, cfg.activeGroup.id));
@@ -367,40 +426,49 @@ ${rosterLine}
 
 Follow the dispatch directive in the task above. If the task says to dispatch to specialists (e.g. "Dispatch in parallel to every relevant specialist"), you MUST emit DISPATCH blocks at the END of your reply (one per specialist, exact format per your system prompt) — do NOT answer inline. Inline answers are only appropriate when the task itself is trivial (e.g. a one-line question) AND does not explicitly request specialist dispatch.`;
   if (iteration === 1) {
-    if (smartDispatch) log("info", "smart dispatch enabled — Producer picks specialists per task");
-    else log("info", "smart dispatch off — Producer must follow preset's dispatch directive");
+    if (smartDispatch) em.log("info", "smart dispatch enabled — Producer picks specialists per task");
+    else em.log("info", "smart dispatch off — Producer must follow preset's dispatch directive");
   }
 
-  const spin = startSpinner(`producer planning`);
+  const spin = em.spinner(`producer planning`);
   const plan = await callAgent({
     agentId: cfg.producerAgent,
     sessionKey: producerSession,
     message: kickoff,
     timeoutSec: timeoutFor(cfg, cfg.producerAgent),
     thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+    onWarn,
   });
   spin.stop(plan.ok ? "ok" : "fail", plan.durationMs);
+  if (plan.stderr) em.warn("producer", `producer stderr: ${plan.stderr.split("\n")[0].slice(0, 160)}`);
 
   if (!plan.ok) {
-    log("error", `Producer planning failed: ${plan.text}`);
+    em.error("producer-plan", `Producer planning failed: ${plan.text.split("\n")[0]}`);
     if (record) record.producerPlan = plan.text;
     if (persist) await persist();
-    return { producerPlan: plan.text, dispatches: [], specialistResults: [], integrated: "", noFindings: false, exitCode: 2 };
+    return { producerPlan: plan.text, dispatches: [], specialistResults: [], integrated: "", noFindings: false,
+      failurePhase: "producer-plan", failureReason: plan.text.split("\n")[0]?.slice(0, 200), exitCode: 2 };
   }
   let producerPlanText = plan.text;
   if (record) record.producerPlan = producerPlanText;
   if (persist) await persist();
-  if (verbose) log("trace", `Producer plan:\n${plan.text}\n`);
+  if (verbose) em.log("trace", `Producer plan:\n${plan.text}\n`);
 
   // --- Phase 2: parse + validate dispatches ---
   let dispatches = parseDispatches(plan.text);
+  // Surface a silent parse miss: Producer clearly TRIED to dispatch (a
+  // "DISPATCH:" appears) but nothing parsed — a malformed block that would
+  // otherwise vanish into the auto-fan-out path with no signal.
+  if (dispatches.length === 0 && /DISPATCH:/i.test(plan.text)) {
+    em.warn("parse-dispatch", `0 dispatches parsed despite "DISPATCH:" present (malformed block?). First 200 chars: ${plan.text.slice(0, 200).replace(/\n/g, " ")}`);
+  }
   // AUDIT roster only — Coder cannot be a valid audit-dispatch target.
   const fullRoster = roster;
   const validRoles = new Set(fullRoster);
   const dropped = dispatches.filter(d => !validRoles.has(roleOf(d.agent, cfg.activeGroup.id)));
   if (dropped.length > 0) {
     for (const d of dropped) {
-      log("warn", `dropping dispatch to "${d.agent}" — not an audit specialist of group ${cfg.activeGroup.id} (valid: ${fullRoster.join(", ")})`);
+      em.warn("dispatch", `dropping dispatch to "${d.agent}" — not an audit specialist of group ${cfg.activeGroup.id} (valid: ${fullRoster.join(", ")})`);
     }
     dispatches = dispatches.filter(d => validRoles.has(roleOf(d.agent, cfg.activeGroup.id)));
   }
@@ -410,7 +478,8 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     const dispatchedRoles = new Set(dispatches.map(d => roleOf(d.agent, cfg.activeGroup.id)));
     const missing = fullRoster.filter(r => !dispatchedRoles.has(r));
     if (missing.length > 0) {
-      log("warn", `Producer dispatched to ${dispatches.length}/${fullRoster.length} specialists. Auto-adding missing: ${missing.join(", ")} (Smart Dispatch OFF + "every/all" directive)`);
+      dispatchMode = "auto-add-missing";
+      em.warn("dispatch", `Producer dispatched to ${dispatches.length}/${fullRoster.length} specialists. Auto-adding missing: ${missing.join(", ")} (Smart Dispatch OFF + "every/all" directive)`);
       for (const role of missing) {
         dispatches.push({
           agent: role,
@@ -429,21 +498,23 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   // --- Phase 2b: enforce Smart Dispatch OFF ---
   const taskHasDispatchDirective = hasDispatchDirective(task);
   if (!smartDispatch && dispatches.length === 0 && taskHasDispatchDirective) {
-    log("warn", `Producer returned 0 dispatches but task explicitly requires dispatch. Retrying with stronger nudge…`);
+    em.warn("dispatch", `Producer returned 0 dispatches but task explicitly requires dispatch. Retrying with stronger nudge…`);
     const retryMsg = `You did NOT emit any DISPATCH blocks. The task above explicitly requires dispatching to specialists ("Dispatch in parallel to every relevant specialist"). The Smart Dispatch override is OFF, so you cannot answer inline. Re-read the task. Emit DISPATCH blocks now, one per specialist, in the exact format from your system prompt. Do not write any analysis or report — only the DISPATCH blocks. Available specialists: ${roster.join(", ")}.`;
-    const spinR = startSpinner(`producer re-planning (forced dispatch)`);
+    const spinR = em.spinner(`producer re-planning (forced dispatch)`);
     const replan = await callAgent({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: retryMsg,
       timeoutSec: timeoutFor(cfg, cfg.producerAgent),
       thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+      onWarn,
     });
     spinR.stop(replan.ok ? "ok" : "fail", replan.durationMs);
     if (replan.ok) {
       const retryDispatches = parseDispatches(replan.text);
       if (retryDispatches.length > 0) {
-        log("ok", `retry produced ${retryDispatches.length} dispatch(es)`);
+        dispatchMode = "retry-then-fan-out";
+        em.log("ok", `retry produced ${retryDispatches.length} dispatch(es)`);
         dispatches = retryDispatches;
         producerPlanText = `${producerPlanText}\n\n---\n[orchestrator: re-planned after 0-dispatch on enforced mode]\n---\n\n${replan.text}`;
         if (record) {
@@ -454,7 +525,8 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
       }
     }
     if (dispatches.length === 0) {
-      log("warn", `Producer still refused to dispatch. Auto-fanning out to all ${roster.length} audit specialists: ${roster.join(", ")}`);
+      dispatchMode = "auto-fan-out";
+      em.warn("dispatch", `Producer still refused to dispatch. Auto-fanning out to all ${roster.length} audit specialists: ${roster.join(", ")}`);
       dispatches = roster.map(role => ({
         agent: role,
         task,
@@ -471,68 +543,76 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   }
 
   if (dispatches.length === 0) {
-    log("ok", `Producer answered inline (no dispatches). Time ${(plan.durationMs / 1000).toFixed(1)}s`);
-    console.log();
-    console.log(chalk.bold.green("=".repeat(72)));
-    console.log(chalk.bold.green("PRODUCER'S INTEGRATED ANSWER"));
-    console.log(chalk.bold.green("=".repeat(72)));
-    console.log(plan.text);
-    console.log();
-    if (record) record.finalAnswer = plan.text;
+    dispatchMode = "inline";
+    em.event({ type: "dispatch_mode", iteration, mode: dispatchMode });
+    em.log("ok", `Producer answered inline (no dispatches). Time ${(plan.durationMs / 1000).toFixed(1)}s`);
+    em.event({ type: "answer", iteration, kind: "inline", text: plan.text });
+    printAnswerBanner(em, plan.text);
+    if (record) { record.finalAnswer = plan.text; record.dispatchMode = dispatchMode; }
     if (persist) await persist();
-    return { producerPlan: producerPlanText, dispatches: [], specialistResults: [], integrated: plan.text, noFindings: detectNoFindings(plan.text), exitCode: 0 };
+    return { producerPlan: producerPlanText, dispatches: [], specialistResults: [], integrated: plan.text, noFindings: detectNoFindings(plan.text), dispatchMode, exitCode: 0 };
   }
 
-  log("info", `Producer wants ${dispatches.length} specialist(s): ${dispatches.map(d => d.agent).join(", ")}`);
+  em.event({ type: "dispatch_mode", iteration, mode: dispatchMode });
+  const dispatchRoles = dispatches.map(d => roleOf(d.agent, cfg.activeGroup.id));
+  em.event({ type: "dispatch_planned", iteration, agents: dispatchRoles, count: dispatches.length });
+  em.log("info", `Producer wants ${dispatches.length} specialist(s): ${dispatchRoles.join(", ")}`);
+  if (record) record.dispatchMode = dispatchMode;
 
   // --- Phase 3: parallel specialist dispatch ---
-  log("phase", "2/4 specialists running in parallel");
-  const results = await runDispatchesInParallel(dispatches, sessionTag, cfg, verbose);
-  if (record) record.specialistResults = results.map(r => ({ agent: r.agent, reply: r.reply, ok: r.ok }));
+  em.event({ type: "phase", phase: "dispatch", iteration, label: "2/4 specialists running in parallel" });
+  em.log("phase", "2/4 specialists running in parallel");
+  const results = await runDispatchesInParallel(dispatches, sessionTag, cfg, verbose, iteration, em);
+  if (record) record.specialistResults = results.map(toSpecialistResult);
   if (persist) await persist();
 
   const okResults = results.filter(r => r.ok);
   const failResults = results.filter(r => !r.ok);
-  log(okResults.length === results.length ? "ok" : "warn",
+  em.log(okResults.length === results.length ? "ok" : "warn",
       `${okResults.length}/${results.length} specialists returned ok`);
 
   if (okResults.length === 0) {
-    log("error", `all ${results.length} specialists failed — nothing to integrate`);
+    em.error("dispatch", `all ${results.length} specialists failed — nothing to integrate`);
     const summary = `All ${results.length} specialists failed:\n\n` +
       failResults.map(r => `- ${r.agent}: ${(r.reply || "").split("\n")[0].slice(0, 200)}`).join("\n");
     if (record) record.finalAnswer = summary;
     if (persist) await persist();
-    printRawReplies(results);
+    printRawReplies(em, results);
     return {
       producerPlan: producerPlanText,
       dispatches,
-      specialistResults: results.map(r => ({ agent: r.agent, reply: r.reply, ok: r.ok })),
+      specialistResults: results.map(toSpecialistResult),
       integrated: summary,
       noFindings: false,
+      dispatchMode,
+      failurePhase: "all-specialists-failed",
+      failureReason: `all ${results.length} specialists failed`,
       exitCode: 1,
     };
   }
 
   // --- Phase 4 (a): tell Producer about failures up front, then ack each ok reply ---
   if (failResults.length > 0) {
-    log("warn", `skipping ${failResults.length} failed specialist(s): ${failResults.map(r => r.agent).join(", ")}`);
+    em.warn("dispatch", `skipping ${failResults.length} failed specialist(s): ${failResults.map(r => r.agent).join(", ")}`);
     const failNote = `Heads up before specialist replies arrive: ${failResults.length} specialist(s) failed and will be skipped — ${failResults.map(r => `${r.agent} (${(r.reply || "").split("\n")[0].slice(0, 120).replace(/\n/g, " ")})`).join("; ")}. When you integrate, note which specialists were unavailable; do not invent their findings.`;
-    const spinN = startSpinner(`notifying producer of failures`);
+    const spinN = em.spinner(`notifying producer of failures`);
     const noteAck = await callAgent({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: failNote,
       timeoutSec: timeoutFor(cfg, cfg.producerAgent),
       thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+      onWarn,
     });
     spinN.stop(noteAck.ok ? "ok" : "fail", noteAck.durationMs);
   }
 
-  log("phase", "3/4 feeding specialist replies to Producer");
+  em.event({ type: "phase", phase: "ack", iteration, label: "3/4 feeding specialist replies to Producer" });
+  em.log("phase", "3/4 feeding specialist replies to Producer");
   for (const r of okResults) {
     const sizeKB = (r.reply.length / 1024).toFixed(1);
     const fitTag = r.reply.length > MAX_ARGV_CHARS - 200 ? chalk.yellow(" [will truncate]") : "";
-    log("info", `posting ${r.agent}'s reply (${sizeKB}KB)${fitTag}`);
+    em.log("info", `posting ${r.agent}'s reply (${sizeKB}KB)${fitTag}`);
 
     let body = `Specialist '${r.agent}' returned the following. Read it; acknowledge briefly; do NOT integrate yet:\n\n${r.reply}`;
     if (body.length > MAX_ARGV_CHARS - 200) {
@@ -540,31 +620,36 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
       body = body.slice(0, trunc) + `\n\n[... reply truncated by orchestrator at ${trunc} chars; full content was ${r.reply.length} chars ...]`;
     }
 
-    const spin2 = startSpinner(`producer acknowledging ${r.agent}`);
+    const spin2 = em.spinner(`producer acknowledging ${r.agent}`);
     const ack = await callAgent({
       agentId: cfg.producerAgent,
       sessionKey: producerSession,
       message: body,
       timeoutSec: timeoutFor(cfg, cfg.producerAgent),
       thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+      onWarn,
     });
     spin2.stop(ack.ok ? "ok" : "fail", ack.durationMs);
     if (!ack.ok) {
-      log("warn", `Producer failed to ack ${r.agent}; falling back to raw replies:`);
-      printRawReplies(results);
+      em.warn("ack", `Producer failed to ack ${r.agent}; falling back to raw replies:`);
+      printRawReplies(em, results);
       return {
         producerPlan: producerPlanText,
         dispatches,
-        specialistResults: results.map(r => ({ agent: r.agent, reply: r.reply, ok: r.ok })),
+        specialistResults: results.map(toSpecialistResult),
         integrated: "",
         noFindings: false,
+        dispatchMode,
+        failurePhase: "ack",
+        failureReason: `Producer failed to acknowledge ${r.agent}`,
         exitCode: 1,
       };
     }
   }
 
   // --- Phase 4 (b): integrate ---
-  log("phase", "4/4 Producer integrating");
+  em.event({ type: "phase", phase: "integrate", iteration, label: "4/4 Producer integrating" });
+  em.log("phase", "4/4 Producer integrating");
   const failedNoteForIntegrate = failResults.length > 0
     ? ` Note: ${failResults.length} specialist(s) — ${failResults.map(r => r.agent).join(", ")} — were unavailable for this run. State that explicitly in the integration; don't invent their findings.`
     : "";
@@ -573,25 +658,29 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     "Address any BLOCK / INVARIANT VIOLATION / REQ DELTA flags. Lead with the result. End with the concrete next step." +
     failedNoteForIntegrate;
 
-  const spin3 = startSpinner("producer integrating");
+  const spin3 = em.spinner("producer integrating");
   const integration = await callAgent({
     agentId: cfg.producerAgent,
     sessionKey: producerSession,
     message: integratePrompt,
     timeoutSec: timeoutFor(cfg, cfg.producerAgent),
     thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+    onWarn,
   });
   spin3.stop(integration.ok ? "ok" : "fail", integration.durationMs);
 
   if (!integration.ok) {
-    log("warn", `integration call failed; raw specialist replies follow.`);
-    printRawReplies(results);
+    em.warn("integrate", `integration call failed; raw specialist replies follow.`);
+    printRawReplies(em, results);
     return {
       producerPlan: producerPlanText,
       dispatches,
-      specialistResults: results.map(r => ({ agent: r.agent, reply: r.reply, ok: r.ok })),
+      specialistResults: results.map(toSpecialistResult),
       integrated: "",
       noFindings: false,
+      dispatchMode,
+      failurePhase: "integrate",
+      failureReason: integration.text.split("\n")[0]?.slice(0, 200),
       exitCode: 1,
     };
   }
@@ -599,30 +688,34 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   if (record) record.finalAnswer = integration.text;
   if (persist) await persist();
 
-  console.log();
-  console.log(chalk.bold.green("=".repeat(72)));
-  console.log(chalk.bold.green("PRODUCER'S INTEGRATED ANSWER"));
-  console.log(chalk.bold.green("=".repeat(72)));
-  console.log(integration.text);
-  console.log();
+  em.event({ type: "answer", iteration, kind: "integrated", text: integration.text });
+  printAnswerBanner(em, integration.text);
 
   return {
     producerPlan: producerPlanText,
     dispatches,
-    specialistResults: results.map(r => ({ agent: r.agent, reply: r.reply, ok: r.ok })),
+    specialistResults: results.map(toSpecialistResult),
     integrated: integration.text,
     noFindings: detectNoFindings(integration.text),
+    dispatchMode,
     exitCode: 0,
   };
 }
 
-interface DispatchResult { agent: string; reply: string; ok: boolean; durationMs: number; }
+interface DispatchResult { agent: string; reply: string; ok: boolean; durationMs: number; exitCode: number; retried: boolean; }
+
+/** Map an in-flight dispatch result to the persisted SpecialistResult shape. */
+function toSpecialistResult(r: DispatchResult): SpecialistResult {
+  return { agent: r.agent, reply: r.reply, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, retried: r.retried };
+}
 
 async function runDispatchesInParallel(
   dispatches: DispatchBlock[],
   sessionTag: string,
   cfg: Config,
   verbose: boolean,
+  iteration: number,
+  em: Emitter,
 ): Promise<DispatchResult[]> {
   // Run with bounded concurrency.
   const sem = new Semaphore(cfg.maxParallel);
@@ -631,7 +724,7 @@ async function runDispatchesInParallel(
   const tasks = dispatches.map(d => sem.run(async () => {
     const role = roleOf(d.agent, cfg.activeGroup.id);
     if (!validRoles.has(role)) {
-      log("warn", `Producer dispatched to "${d.agent}" which is not an audit specialist of group ${cfg.activeGroup.id}. Attempting anyway.`);
+      em.warn("dispatch", `Producer dispatched to "${d.agent}" which is not an audit specialist of group ${cfg.activeGroup.id}. Attempting anyway.`);
     }
     const qualifiedAgentId = fullyQualify(role, cfg.activeGroup.id);
     const sessionKey = `agent:${qualifiedAgentId}:${sessionTag}`;
@@ -639,30 +732,41 @@ async function runDispatchesInParallel(
     const baseTimeout = timeoutFor(cfg, qualifiedAgentId);
     const taskLabel = `${role}: ${d.task.slice(0, 60)}${d.task.length > 60 ? "…" : ""}`;
 
-    let spin = startSpinner(taskLabel);
+    em.event({ type: "specialist_started", iteration, agent: role, label: d.task.slice(0, 80) });
+    let spin = em.spinner(taskLabel);
     let r = await callAgent({
       agentId: qualifiedAgentId,
       sessionKey,
       message: msg,
       timeoutSec: baseTimeout,
       thinkingLevel: thinkingFor(cfg, qualifiedAgentId),
+      onWarn: (m) => em.warn("agent", m),
     });
     spin.stop(r.ok ? "ok" : "fail", r.durationMs);
+    let totalMs = r.durationMs;
+    let retried = false;
 
     if (!r.ok && r.exitCode === -1) {
+      retried = true;
+      const firstMs = r.durationMs;
       const bumpedTimeout = Math.round(baseTimeout * 1.5);
-      log("warn", `${role} timed out at ${(r.durationMs/1000).toFixed(0)}s. Retrying once with ${bumpedTimeout}s budget…`);
+      em.event({ type: "retry", iteration, agent: role, reason: "timeout", baseTimeoutSec: baseTimeout, bumpedTimeoutSec: bumpedTimeout });
+      em.warn("dispatch", `${role} timed out at ${(r.durationMs/1000).toFixed(0)}s. Retrying once with ${bumpedTimeout}s budget…`);
       const resumeMsg = `Continue your prior reply. You were interrupted by timeout. If you'd already produced your DELIVERABLE, repeat it; if you were mid-investigation, finish and produce the DELIVERABLE now.`;
-      spin = startSpinner(`${taskLabel} (retry)`);
+      spin = em.spinner(`${taskLabel} (retry)`);
       r = await callAgent({
         agentId: qualifiedAgentId,
         sessionKey,
         message: resumeMsg,
         timeoutSec: bumpedTimeout,
         thinkingLevel: thinkingFor(cfg, qualifiedAgentId),
+        onWarn: (m) => em.warn("agent", m),
       });
       spin.stop(r.ok ? "ok" : "fail", r.durationMs);
+      totalMs = firstMs + r.durationMs; // don't lose the first attempt's cost
     }
+
+    if (r.stderr) em.warn("dispatch", `${role} stderr: ${r.stderr.split("\n")[0].slice(0, 160)}`);
 
     let finalReply = r.text;
     if (r.ok && !cfg.disableCitationCheck && cfg.workspace) {
@@ -674,16 +778,21 @@ async function runDispatchesInParallel(
           finalReply = r.text + "\n" + report;
           const bad = verified.filter(v => v.status === "file-not-found" || v.status === "line-out-of-range").length;
           const ambig = verified.filter(v => v.status === "ambiguous-basename").length;
-          if (bad > 0)        log("warn", `${role}: ${bad}/${verified.length} citation(s) unverified`);
-          else if (ambig > 0) log("info", `${role}: ${verified.length} citation(s) checked (${ambig} ambiguous, 0 unverified)`);
-          else                log("ok",   `${role}: ${verified.length}/${verified.length} citation(s) verified`);
+          em.event({ type: "citation_check", iteration, agent: role, total: verified.length,
+            verified: verified.length - bad, unverified: bad });
+          if (bad > 0)        em.warn("citation", `${role}: ${bad}/${verified.length} citation(s) unverified`);
+          else if (ambig > 0) em.log("info", `${role}: ${verified.length} citation(s) checked (${ambig} ambiguous, 0 unverified)`);
+          else                em.log("ok",   `${role}: ${verified.length}/${verified.length} citation(s) verified`);
         }
       }
+    } else if (r.ok && !cfg.disableCitationCheck && !cfg.workspace) {
+      em.event({ type: "citation_check", iteration, agent: role, total: 0, verified: 0, unverified: 0, skippedReason: "no-workspace" });
     }
 
-    if (verbose && r.ok) log("trace", `${role} reply:\n${finalReply}\n`);
-    if (!r.ok) log("warn", `${role} failed: ${r.text.split("\n")[0]}`);
-    return { agent: role, reply: finalReply, ok: r.ok, durationMs: r.durationMs };
+    if (verbose && r.ok) em.log("trace", `${role} reply:\n${finalReply}\n`);
+    if (!r.ok) em.warn("dispatch", `${role} failed: ${r.text.split("\n")[0]}`);
+    em.event({ type: "specialist_done", iteration, agent: role, ok: r.ok, durationMs: totalMs, exitCode: r.exitCode, retried });
+    return { agent: role, reply: finalReply, ok: r.ok, durationMs: totalMs, exitCode: r.exitCode, retried };
   }));
   return Promise.all(tasks);
 }
@@ -705,44 +814,22 @@ class Semaphore {
   }
 }
 
-// --- tiny logging + spinner UI ---
+// --- human-readable banners (suppressed in jsonMode; the `answer`/`coder`
+//     events carry the same content for the GUI/event consumers) ---
 
-type Level = "info" | "phase" | "ok" | "warn" | "error" | "trace";
-
-function log(level: Level, msg: string) {
-  const tag = {
-    info:  chalk.cyan("[info ]"),
-    phase: chalk.bold.cyan("[phase]"),
-    ok:    chalk.green("[ ok  ]"),
-    warn:  chalk.yellow("[warn ]"),
-    error: chalk.red("[error]"),
-    trace: chalk.gray("[trace]"),
-  }[level];
-  console.log(`${tag} ${msg}`);
+/** The integrated/inline answer banner the CLI shows. */
+function printAnswerBanner(em: Emitter, text: string) {
+  if (em.jsonMode) return;
+  console.log();
+  console.log(chalk.bold.green("=".repeat(72)));
+  console.log(chalk.bold.green("PRODUCER'S INTEGRATED ANSWER"));
+  console.log(chalk.bold.green("=".repeat(72)));
+  console.log(text);
+  console.log();
 }
 
-function startSpinner(label: string) {
-  const frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
-  let i = 0;
-  const start = Date.now();
-  const isTTY = !!process.stdout.isTTY;
-  const interval = isTTY ? setInterval(() => {
-    const secs = ((Date.now() - start) / 1000).toFixed(0);
-    process.stdout.write(`\r  ${chalk.cyan(frames[i++ % frames.length])} ${label} (${secs}s)   `);
-  }, 100) : null;
-  if (!isTTY) console.log(`  · ${label}`);
-  return {
-    stop(status: "ok" | "fail", durationMs: number) {
-      if (interval) clearInterval(interval);
-      const secs = (durationMs / 1000).toFixed(1);
-      const mark = status === "ok" ? chalk.green("✓") : chalk.red("✗");
-      if (isTTY) process.stdout.write(`\r  ${mark} ${label} (${secs}s)${" ".repeat(20)}\n`);
-      else console.log(`  ${status === "ok" ? "ok" : "FAIL"}: ${label} (${secs}s)`);
-    },
-  };
-}
-
-function printRawReplies(results: DispatchResult[]) {
+function printRawReplies(em: Emitter, results: DispatchResult[]) {
+  if (em.jsonMode) return;
   for (const r of results) {
     console.log();
     console.log(chalk.bold.cyan(`=== ${r.agent} ===`));
@@ -751,18 +838,17 @@ function printRawReplies(results: DispatchResult[]) {
 }
 
 /**
- * G.2/G.3 — print the Coder's reply with a clear header so the GUI's
- * answer-panel collector (main.js — captures everything between
- * "PRODUCER'S INTEGRATED ANSWER" and "[ ok  ] done.") includes the diff +
- * touched-files summary alongside the audit integration. Without this the
- * Coder reply lives only in the run record JSON and the user sees a generic
- * audit-style answer with no indication of what was actually changed.
+ * G.2/G.3 — print the Coder's reply with a clear header for the CLI. The GUI
+ * gets the same content via the `coder` event; the human banner is suppressed
+ * in jsonMode.
  */
 function printCoderReport(
   result: { ok: boolean; reply: string; durationMs: number },
   iteration: number,
   coderRole: string,
+  em: Emitter,
 ) {
+  if (em.jsonMode) return;
   const headerColor = result.ok ? chalk.bold.yellow : chalk.bold.red;
   const statusWord = result.ok ? "REPORT" : "FAILED";
   const iterTag = iteration > 1 ? ` (iteration ${iteration})` : "";

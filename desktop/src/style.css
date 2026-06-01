@@ -772,3 +772,41 @@ button.small { padding: 6px 10px; font-size: 12px; }
 .answer-body::-webkit-scrollbar-track { background: transparent; }
 .answer-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 .answer-body::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* --- observability UI: retry state, citation badge, runId chip, banner --- */
+.agent-card.retrying { border-color: var(--warn); }
+.spinner.retry { border-top-color: var(--warn); }
+.cite { margin-left: 8px; font-size: 11px; }
+.cite.ok { color: var(--ok); }
+.cite.bad { color: var(--err); }
+
+.run-id-chip {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.run-id-chip:hover { border-color: var(--border); }
+.run-id-chip.live { color: var(--accent); border-color: var(--accent); }
+
+.app-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+.app-banner.hidden { display: none; }
+.app-banner.warn  { border-color: var(--warn);   color: var(--warn);   background: rgba(251,191,36,0.06); }
+.app-banner.error { border-color: var(--err);    color: var(--err);    background: rgba(251,113,133,0.06); }
+.app-banner.info  { border-color: var(--accent); color: var(--accent); background: rgba(34,211,238,0.06); }
+.app-banner .ghost.small { background: transparent; border: none; color: inherit; cursor: pointer; font-size: 13px; padding: 0 4px; }

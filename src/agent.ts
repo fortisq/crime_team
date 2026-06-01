@@ -52,16 +52,23 @@ function loadAgentModels(): Map<string, string> {
  * claude-cli with an empty stderr (silent failure, looks like a hang to the
  * orchestrator). Logs a warn to stderr when it clamps so debugging is obvious.
  */
-export function clampThinking(agentId: string, thinking: string | undefined): string | undefined {
+export function clampThinking(
+  agentId: string,
+  thinking: string | undefined,
+  onWarn?: (msg: string) => void,
+): string | undefined {
   if (!thinking || thinking === "" || thinking === "off") return thinking;
   if (thinking !== "max") return thinking;
   const model = loadAgentModels().get(agentId) ?? "";
   const isOpus = /^anthropic\/claude-opus/i.test(model);
   if (isOpus) return thinking;
-  process.stderr.write(
-    `[agent.ts] clamping thinking='max' → 'high' for ${agentId} ` +
-    `(model='${model || "unknown"}' does not support 'max'; only Anthropic Opus does)\n`
-  );
+  const msg =
+    `clamping thinking='max' → 'high' for ${agentId} ` +
+    `(model='${model || "unknown"}' does not support 'max'; only Anthropic Opus does)`;
+  // Route through the caller's logger when available so it lands in the
+  // structured event stream; fall back to stderr for standalone use.
+  if (onWarn) onWarn(msg);
+  else process.stderr.write(`[agent.ts] ${msg}\n`);
   return "high";
 }
 
@@ -70,6 +77,12 @@ export function clampThinking(agentId: string, thinking: string | undefined): st
 // command line gets truncated/mangled.
 export const MAX_ARGV_CHARS = 28000;
 
+// Grace added to the per-call timeout before we SIGKILL the child — gives
+// openclaw room to wind down a slow claude-cli finalize. Shared by the timer
+// and the "killed after" message so they can never drift (they used to: timer
+// was +120 while the message said +30).
+const KILL_GRACE_SEC = 120;
+
 // Launch OpenClaw directly via Node, bypassing the .cmd shim.
 // `spawn` with shell:false can't invoke .cmd on Windows (EINVAL), and using
 // shell:true reintroduces argv quoting hazards. The .mjs entry is cleanest.
@@ -77,6 +90,29 @@ const NODE_BIN = process.execPath;
 const OPENCLAW_MJS =
   process.env.OPENCLAW_BIN ||
   `${process.env.APPDATA}\\npm\\node_modules\\openclaw\\openclaw.mjs`;
+
+// Minimal environment for spawned children. Passing the parent's full
+// `process.env` wholesale leaked every secret (AWS keys, unrelated tokens) into
+// every specialist subprocess. Forward only what openclaw/Node/Windows need:
+// a fixed set plus auth/proxy vars by prefix.
+const ENV_ALLOW_FIXED = [
+  "PATH", "Path", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME",
+  "SystemRoot", "windir", "TEMP", "TMP", "ComSpec", "PATHEXT", "NUMBER_OF_PROCESSORS",
+  "NODE_OPTIONS", "OPENCLAW_BIN", "CRIME_TEAM_NODE",
+];
+const ENV_ALLOW_PREFIX = /^(OPENCLAW_|ANTHROPIC_|OPENAI_|GOOGLE_|DEEPSEEK_|OPENROUTER_|AZURE_)/;
+const ENV_ALLOW_PROXY = /^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)$/i;
+
+export function childEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (ENV_ALLOW_FIXED.includes(k) || ENV_ALLOW_PREFIX.test(k) || ENV_ALLOW_PROXY.test(k)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
 
 /**
  * Call `openclaw agent` and capture the full reply.
@@ -92,7 +128,7 @@ export function callAgent(opts: AgentCallOpts): Promise<AgentCallResult> {
     "--message", opts.message,
     "--timeout", String(timeoutSec),
   ];
-  const safeThinking = clampThinking(opts.agentId, opts.thinkingLevel);
+  const safeThinking = clampThinking(opts.agentId, opts.thinkingLevel, opts.onWarn);
   if (safeThinking && safeThinking.length > 0) {
     args.push("--thinking", safeThinking);
   }
@@ -112,7 +148,7 @@ export function callAgent(opts: AgentCallOpts): Promise<AgentCallResult> {
     const child = spawn(NODE_BIN, [OPENCLAW_MJS, ...args], {
       shell: false,
       windowsHide: true,
-      env: process.env,
+      env: childEnv(),
     });
 
     let stdout = "";
@@ -121,11 +157,11 @@ export function callAgent(opts: AgentCallOpts): Promise<AgentCallResult> {
 
     // Generous buffer over openclaw's own timeout — when claude-cli sessions
     // are slow to finalize, the wrapper killing too aggressively turns a recoverable
-    // late-finish into a hard failure. Give openclaw 2 min to wind down gracefully.
+    // late-finish into a hard failure. Give openclaw this grace to wind down.
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGKILL"); } catch {}
-    }, (timeoutSec + 120) * 1000);
+    }, (timeoutSec + KILL_GRACE_SEC) * 1000);
 
     child.stdout.on("data", (b: Buffer) => {
       const s = b.toString("utf8");
@@ -151,15 +187,27 @@ export function callAgent(opts: AgentCallOpts): Promise<AgentCallResult> {
     child.on("close", (code) => {
       clearTimeout(timer);
       const durationMs = Date.now() - start;
-      const combined = (stdout + (stderr ? `\n[stderr]\n${stderr}` : "")).trim();
+      // Keep stderr OUT of the reply text: it carries tooling noise and can
+      // include credential-error fragments that must not flow into the run
+      // record or back into Producer context. The caller surfaces it as a warn.
+      const out = stdout.trim();
+      const err = stderr.trim();
 
       if (timedOut) {
-        resolve({ ok: false, text: `[orchestrator] killed after ${timeoutSec + 30}s timeout. Partial:\n${combined}`, durationMs, exitCode: -1 });
+        resolve({
+          ok: false,
+          text: `[orchestrator] killed after ${timeoutSec + KILL_GRACE_SEC}s timeout. Partial:\n${out}`,
+          stderr: err || undefined,
+          durationMs,
+          exitCode: -1,
+        });
         return;
       }
+      // Error-marker check scans stdout only (those markers are openclaw's own
+      // prints); a non-empty stderr does NOT by itself fail the call.
       const ok = code === 0
-        && !/^(GatewayClientRequestError|GatewayTransportError|FailoverError|Error:|EMBEDDED FALLBACK)/.test(combined);
-      resolve({ ok, text: combined, durationMs, exitCode: code ?? -1 });
+        && !/^(GatewayClientRequestError|GatewayTransportError|FailoverError|Error:|EMBEDDED FALLBACK)/.test(out);
+      resolve({ ok, text: out, stderr: err || undefined, durationMs, exitCode: code ?? -1 });
     });
   });
 }

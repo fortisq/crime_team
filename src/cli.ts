@@ -19,6 +19,7 @@ interface Args {
   verbose: boolean;
   resume?: string;
   runId?: string;
+  json: boolean;
   timeout?: number;
   help: boolean;
   smartDispatch: boolean;
@@ -28,12 +29,13 @@ interface Args {
 }
 
 function parseArgv(argv: string[]): Args {
-  const a: Args = { verbose: false, help: false, smartDispatch: false, useCoder: false };
+  const a: Args = { verbose: false, help: false, smartDispatch: false, useCoder: false, json: false };
   const tokens = argv.slice(2);
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i]!;
     if (t === "--help" || t === "-h") a.help = true;
     else if (t === "--verbose" || t === "-v") a.verbose = true;
+    else if (t === "--json") a.json = true;
     else if (t === "--smart-dispatch" || t === "--smart") a.smartDispatch = true;
     else if (t === "--use-coder") a.useCoder = true;
     else if (t === "--loop") {
@@ -73,6 +75,8 @@ OPTIONS
   --group, -g <id>    Group id (defaults to activeGroupId in ~/.crime-team/groups.json)
   --run-id <id>       Use this id for a fresh run (record/marker/events align).
                       The desktop GUI passes its run UUID here.
+  --json              Emit machine-readable NDJSON events only (one @@CTEVT@@
+                      line per event); suppresses human log lines + spinner.
   --resume <id>       (planned) Resume an earlier run
   --help, -h          Show this
 
@@ -136,6 +140,7 @@ async function main() {
     // --resume reuses an id to re-run (see its caveats in README). If both are
     // given, the explicit --run-id wins.
     runId: args.runId ?? args.resume,
+    json: args.json,
     verbose: args.verbose,
     smartDispatch: args.smartDispatch,
     useCoder: args.useCoder,

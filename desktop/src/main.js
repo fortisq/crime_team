@@ -98,6 +98,9 @@ const els = {
   phaseLabel:  document.getElementById("phaseLabel"),
   elapsedLbl:  document.getElementById("elapsedTotal"),
   runIdLbl:    document.getElementById("runIdLabel"),
+  appBanner:   document.getElementById("appBanner"),
+  appBannerText: document.getElementById("appBannerText"),
+  appBannerClose: document.getElementById("appBannerClose"),
   agents:      document.getElementById("agents"),
   runsList:    document.getElementById("runsList"),
   rootPath:    document.getElementById("rootPath"),
@@ -116,10 +119,42 @@ async function loadPresetsForActiveGroup() {
       ANGLES = Array.isArray(data.angles) && data.angles.length ? data.angles : BUNDLED_ANGLES;
       return;
     }
-  } catch {}
+  } catch (e) {
+    console.warn("[presets] load failed, using bundled fallback:", e);
+    showBanner("Custom presets failed to load — using built-in defaults.", "warn");
+  }
   PRESETS = BUNDLED_PRESETS;
   ANGLES = BUNDLED_ANGLES;
 }
+
+// --- app banner (visible error/warning surface, outside the log panel) ---
+let bannerTimer = null;
+function showBanner(msg, kind = "warn") {
+  if (!els.appBanner) return;
+  els.appBannerText.textContent = msg;
+  els.appBanner.className = `app-banner ${kind}`;
+  if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  // Errors persist until dismissed; warn/info auto-hide.
+  if (kind !== "error") bannerTimer = setTimeout(hideBanner, 9000);
+}
+function hideBanner() {
+  if (!els.appBanner) return;
+  els.appBanner.className = "app-banner hidden";
+}
+els.appBannerClose?.addEventListener("click", hideBanner);
+
+// Click-to-copy the runId — de-emphasized in normal use but the first thing a
+// support report needs when a run breaks.
+els.runIdLbl?.addEventListener("click", async () => {
+  const id = els.runIdLbl.dataset.runid;
+  if (!id) return;
+  try {
+    await navigator.clipboard.writeText(id);
+    const prev = els.runIdLbl.textContent;
+    els.runIdLbl.textContent = "copied!";
+    setTimeout(() => { els.runIdLbl.textContent = prev; }, 1000);
+  } catch {}
+});
 
 function populatePresets() {
   // Clear before rebuilding (called on group switch + initial load)
@@ -183,28 +218,26 @@ function onTaskEdit() {
 // --- state ---
 let activeRun = null;          // { id, startedAt, agents: Map<name, AgentState>, log: string[], answer: string|null }
 let elapsedTimer = null;
-let collectingAnswer = false;
-let answerBuf = "";
 
-const PHASE_RE = /^\[phase\]\s*(.+)$/;
+// Log-line coloring tag (the only string contract left — the orchestrator's
+// structured state now arrives as `orchestrator:event`, not scraped from text).
 const INFO_RE  = /^\[(info|ok|warn|error|trace)\s*\]\s*(.+)$/;
-const RUNID_RE = /^\[info\s*\]\s*runId=(\S+)/;
-const SPIN_START_RE = /^\s*·\s+(.+?)$/;
-const SPIN_OK_RE    = /^\s*ok:\s*(.+?)\s*\((\d+(?:\.\d+)?)s\)\s*$/;
-const SPIN_FAIL_RE  = /^\s*FAIL:\s*(.+?)\s*\((\d+(?:\.\d+)?)s\)\s*$/;
-// Capture the spinner glyph in a group so success/fail can be told apart
-// without resorting to line.includes("ok") (which misfires on labels like
-// "Look for bugs" because "Look" contains "ok").
-const SPIN_TTY_RE   = /^\s*([✓✗])\s+(.+?)\s*\((\d+(?:\.\d+)?)s\)/;
-const SPECIALISTS_RE= /Producer wants \d+ specialist\(s\):\s*(.+)$/;
-// Fallback roles for when the active group hasn't loaded yet (e.g. early in
-// startup or for an inline answer before the group dropdown fires). The
-// authoritative source is the active group's specialist list — see
-// `agentNameFromLabel`.
+// Fallback roles for legacy paths (e.g. agentNameFromLabel). The authoritative
+// source is the active group's specialist list.
 const FALLBACK_ROLES = ["producer","architect","frontend","art-director","qa","security","backend","desktop"];
-const ANSWER_HEADER = "PRODUCER'S INTEGRATED ANSWER";
-const ANSWER_SEP    = "========================================================================";
-const DONE_RE       = /done\. runId=\S+\. total\s+([\d.]+)s/;
+
+// Process exit-code legend: turns a bare "exit 124" into something an operator
+// can act on. 124 = OS timeout (SIGTERM), 130 = SIGINT/cancel.
+const EXIT_LEGEND = {
+  0:   { label: "done",      hint: "" },
+  1:   { label: "error",     hint: "The orchestrator hit an error — check the log." },
+  124: { label: "timed out", hint: "Increase Timeout (s) and re-run, or narrow the task." },
+  130: { label: "cancelled", hint: "" },
+};
+function describeExit(code) {
+  const e = EXIT_LEGEND[code];
+  return e ? `${e.label} (exit ${code})` : `exit ${code}`;
+}
 
 function strip(s) { return s.replace(/\x1b\[[0-9;]*m/g, ""); }
 
@@ -220,8 +253,11 @@ function setElapsed(secs) {
   els.elapsedLbl.textContent = `elapsed ${secs.toFixed(1)}s`;
 }
 
-function setRunIdLabel(id) {
+function setRunIdLabel(id, live = false) {
   els.runIdLbl.textContent = id ? `runId ${id}` : "";
+  els.runIdLbl.dataset.runid = id || "";
+  els.runIdLbl.classList.toggle("live", !!(id && live));
+  els.runIdLbl.title = id ? "click to copy runId" : "";
 }
 
 function startElapsedTimer() {
@@ -270,11 +306,19 @@ function agentNameFromLabel(label) {
   return null;
 }
 
+const EMOJI_PALETTE = ["🧠","🛡️","🧪","📐","🗺️","🔧","🎯","🧩","📡","⚙️","🔬","🧱","🎚️","📦","🛰️"];
 function emoji(agent) {
   const role = roleOf(agent);
-  return {
-    producer: "🎬", architect: "🏛️", frontend: "🎨", "art-director": "🖼️", qa: "🔍", security: "🔐",
-  }[role] ?? "🤖";
+  // Known stock roles keep their icon; the Coder gets a wrench; every other
+  // (wizard-created) specialist gets a STABLE distinct icon derived from its
+  // role name — far better than the old "everything not in this list is 🤖".
+  const known = {
+    producer: "🎬", architect: "🏛️", frontend: "🎨", "art-director": "🖼️", qa: "🔍", security: "🔐", coder: "🛠️",
+  };
+  if (known[role]) return known[role];
+  let h = 0;
+  for (let i = 0; i < role.length; i++) h = (h * 31 + role.charCodeAt(i)) >>> 0;
+  return EMOJI_PALETTE[h % EMOJI_PALETTE.length];
 }
 
 function ensureAgentCard(name) {
@@ -295,16 +339,27 @@ function renderAgents() {
   els.agents.innerHTML = "";
   for (const a of activeRun.agents.values()) {
     const card = document.createElement("div");
-    card.className = `agent-card ${a.status === "ok" ? "ok" : a.status === "fail" ? "fail" : a.status === "running" ? "running" : ""}`;
-    const dot = a.status === "running" ? '<span class="spinner"></span>'
-              : a.status === "ok"      ? '<span class="dot-ok"></span>'
-              : a.status === "fail"    ? '<span class="dot-fail"></span>'
-              :                          '<span class="dot-wait"></span>';
+    const cls = a.status === "ok" ? "ok" : a.status === "fail" ? "fail"
+              : a.status === "running" ? "running" : a.status === "retrying" ? "retrying" : "";
+    card.className = `agent-card ${cls}`;
+    const dot = a.status === "running"  ? '<span class="spinner"></span>'
+              : a.status === "retrying" ? '<span class="spinner retry"></span>'
+              : a.status === "ok"       ? '<span class="dot-ok"></span>'
+              : a.status === "fail"     ? '<span class="dot-fail"></span>'
+              :                           '<span class="dot-wait"></span>';
+    let cite = "";
+    if (a.citations) {
+      if (a.citations.skipped) cite = `<span class="cite">cite: skipped</span>`;
+      else if (a.citations.total) {
+        const bad = a.citations.unverified || 0;
+        cite = `<span class="cite ${bad ? "bad" : "ok"}">cite ${a.citations.total - bad}/${a.citations.total}</span>`;
+      }
+    }
     card.innerHTML = `
       <div class="agent-card-name">${dot}<span>${emoji(a.name)} ${a.name}</span></div>
       <div class="agent-card-task">${escapeHtml(a.label || "waiting…")}</div>
       <div class="agent-card-meta">
-        <span>${a.status}</span>
+        <span>${a.status}${cite}</span>
         <span>${a.elapsed != null ? a.elapsed.toFixed(1) + "s" : ""}</span>
       </div>
     `;
@@ -327,78 +382,61 @@ function appendLogLine(rawLine) {
   els.logPre.scrollTop = els.logPre.scrollHeight;
 }
 
-function parseLine(rawLine) {
-  const line = strip(rawLine);
-
-  // capture runId
-  const ridM = line.match(RUNID_RE);
-  if (ridM) { setRunIdLabel(ridM[1]); }
-
-  // phases
-  const phaseM = line.match(PHASE_RE);
-  if (phaseM) setPhase(phaseM[1].trim());
-
-  // "Producer wants N specialist(s): a, b"
-  const specs = line.match(SPECIALISTS_RE);
-  if (specs) {
-    for (const s of specs[1].split(",")) {
-      ensureAgentCard(s.trim());
-    }
-  }
-
-  // spinner start (non-TTY format: "  · <label>")
-  const startM = line.match(SPIN_START_RE);
-  if (startM) {
-    const label = startM[1];
-    const a = agentNameFromLabel(label);
-    if (a) setAgent(a, { status: "running", label });
-  }
-
-  // spinner OK (non-TTY: "  ok: <label> (Ns)")
-  const okM = line.match(SPIN_OK_RE);
-  if (okM) {
-    const label = okM[1];
-    const elapsed = parseFloat(okM[2]);
-    const a = agentNameFromLabel(label);
-    if (a) setAgent(a, { status: "ok", label, elapsed });
-  }
-  // spinner FAIL (non-TTY: "  FAIL: <label> (Ns)")
-  const failM = line.match(SPIN_FAIL_RE);
-  if (failM) {
-    const label = failM[1];
-    const elapsed = parseFloat(failM[2]);
-    const a = agentNameFromLabel(label);
-    if (a) setAgent(a, { status: "fail", label, elapsed });
-  }
-  // spinner TTY (real terminal: "  ✓ <label> (Ns)" or "  ✗ <label> (Ns)").
-  // Use the captured glyph — not line.includes("ok") — to disambiguate, so
-  // labels like "Look for bugs" (which contain "ok" as a substring) don't
-  // mark a failed run as successful.
-  const ttyM = line.match(SPIN_TTY_RE);
-  if (ttyM) {
-    const status = ttyM[1] === "✓" ? "ok" : "fail";
-    const label = ttyM[2];
-    const elapsed = parseFloat(ttyM[3]);
-    const a = agentNameFromLabel(label);
-    if (a) setAgent(a, { status, label, elapsed });
-  }
-
-  // answer header detection — start collecting after the second "===" separator
-  if (collectingAnswer) {
-    if (line.startsWith("[ ok  ] done.")) {
-      collectingAnswer = false;
-      activeRun.answer = answerBuf.trim();
+/**
+ * Consume one structured orchestrator event. This replaced the old
+ * regex-scraping of stdout: state (phase, agent cards, the answer) now comes
+ * from a typed contract, so a cosmetic log-format tweak can't silently break
+ * the answer panel. Unknown event types are ignored (forward-compatible).
+ */
+function onEvent(evt) {
+  if (!evt || typeof evt.type !== "string") return;
+  switch (evt.type) {
+    case "run_started":
+      if (evt.runId) setRunIdLabel(evt.runId, true);
+      break;
+    case "phase":
+      setPhase(evt.label ?? evt.phase ?? "");
+      break;
+    case "dispatch_planned":
+      for (const role of evt.agents ?? []) ensureAgentCard(role);
+      break;
+    case "dispatch_mode":
+      if (evt.mode && evt.mode !== "parallel") setPhase(`dispatch: ${evt.mode}`);
+      break;
+    case "specialist_started":
+      setAgent(evt.agent, { status: "running", label: evt.label || "working…" });
+      break;
+    case "specialist_done":
+      setAgent(evt.agent, {
+        status: evt.ok ? "ok" : "fail",
+        label: evt.ok ? "done" : "failed",
+        elapsed: evt.durationMs != null ? evt.durationMs / 1000 : null,
+      });
+      break;
+    case "retry":
+      setAgent(evt.agent, { status: "retrying", label: `timed out — retrying (${evt.bumpedTimeoutSec ?? "?"}s)…` });
+      break;
+    case "citation_check":
+      if (evt.agent) setAgent(evt.agent, { citations: { total: evt.total, unverified: evt.unverified, skipped: evt.skippedReason } });
+      break;
+    case "answer":
+      activeRun.answer = (evt.text ?? "").trim();
       els.answerBody.textContent = activeRun.answer;
       showSections({ status: true, log: true, answer: true });
-    } else if (!line.startsWith(ANSWER_SEP)) {
-      answerBuf += rawLine + "\n";
-    }
-  } else if (line.includes(ANSWER_HEADER)) {
-    collectingAnswer = true;
-    answerBuf = "";
+      break;
+    case "coder":
+      setPhase(evt.ok ? `coder done (${(evt.durationMs / 1000).toFixed(0)}s)` : "coder failed");
+      break;
+    case "warn":
+      appendLogLine(`[warn ] ${evt.msg ?? ""}`);
+      break;
+    case "error":
+      appendLogLine(`[error] ${evt.msg ?? ""}`);
+      if (evt.fatal) showBanner(`${evt.phase ? evt.phase + ": " : ""}${evt.msg ?? "error"}`, "error");
+      break;
+    default:
+      break; // done is handled by the process-level orchestrator:done
   }
-
-  appendLogLine(rawLine);
 }
 
 // --- run lifecycle ---
@@ -458,8 +496,7 @@ async function startRun() {
   }
 
   activeRun = { id: null, startedAt: new Date().toISOString(), agents: new Map(), log: [], answer: null };
-  collectingAnswer = false;
-  answerBuf = "";
+  hideBanner();
 
   els.runBtn.disabled = true;
   els.cancelBtn.disabled = false;
@@ -491,9 +528,10 @@ async function startRun() {
     // it lets us label the run, drop stale events from a previous/dying run,
     // and load this exact record from history afterward.
     activeRun.id = id;
-    setRunIdLabel(id);
+    setRunIdLabel(id, true);
   } catch (e) {
     appendLogLine(`[error] failed to start: ${e}`);
+    showBanner(`Failed to start run: ${e}`, "error");
     finishRun(null);
   }
 }
@@ -505,6 +543,8 @@ async function cancelRun() {
   const usingLoop = els.useCoder?.checked && els.loop?.checked && Number(els.loopMax?.value) > 1;
   if (usingLoop) {
     appendLogLine("[warn ] soft-cancel requested — will stop after current iteration");
+    setPhase("cancelling…");
+    showBanner("Soft-cancel requested — finishing the current iteration, then stopping.", "info");
     try {
       await invoke("cancel_run_soft");
       return;
@@ -514,13 +554,15 @@ async function cancelRun() {
   }
   try {
     await invoke("cancel_run");
+    setPhase("cancelling…");
     appendLogLine("[warn ] cancel requested");
   } catch (e) {
     appendLogLine(`[error] cancel failed: ${e}`);
+    showBanner(`Cancel failed: ${e}`, "error");
   }
 }
 
-function finishRun(exitCode) {
+function finishRun(exitCode, waitError) {
   stopElapsedTimer();
   els.runBtn.disabled = false;
   els.cancelBtn.disabled = true;
@@ -528,17 +570,40 @@ function finishRun(exitCode) {
   if (exitCode != null) {
     appendLogLine(`[info ] process exited code=${exitCode}`);
   }
+  if (waitError) {
+    appendLogLine(`[error] ${waitError}`);
+    showBanner(`Run ended abnormally: ${waitError}`, "error");
+  }
   // Reconcile agent cards: on a non-clean exit (crash, cancel, spawn failure)
-  // any specialist still showing the spinner or "waiting…" never reported back.
-  // Mark those failed instead of leaving them spinning on the cyan dot forever.
+  // any specialist still showing the spinner/retrying or "waiting…" never
+  // reported back. Mark those failed instead of leaving them spinning forever.
   if (exitCode !== 0) {
     for (const [name, a] of activeRun.agents) {
-      if (a.status === "running" || a.status === "wait") {
+      if (a.status === "running" || a.status === "wait" || a.status === "retrying") {
         setAgent(name, { status: "fail", label: a.label || "did not finish" });
       }
     }
   }
-  setPhase(exitCode === 0 ? "done" : exitCode == null ? "stopped" : `exit ${exitCode}`);
+  // Answer safety net: if the run finished but no `answer` event arrived (hard
+  // kill mid-answer, format change), fall back to the saved record's
+  // finalAnswer so the answer is never silently lost.
+  if (!activeRun.answer && activeRun.id) {
+    invoke("get_run", { runId: activeRun.id })
+      .then(r => {
+        if (r?.finalAnswer) {
+          activeRun.answer = r.finalAnswer;
+          els.answerBody.textContent = r.finalAnswer;
+          showSections({ status: true, log: true, answer: true });
+        }
+      })
+      .catch(() => {});
+  }
+  // Surface a recovery hint for known non-zero exits when the log is collapsed.
+  if (exitCode != null && exitCode !== 0) {
+    const e = EXIT_LEGEND[exitCode];
+    if (e?.hint && els.logSec.classList.contains("collapsed")) showBanner(e.hint, "warn");
+  }
+  setPhase(exitCode === 0 ? "done" : waitError ? "error (internal)" : exitCode == null ? "stopped" : describeExit(exitCode));
   // refresh history sidebar
   refreshRuns();
 }
@@ -581,24 +646,42 @@ async function loadRun(runId, itemEl) {
       id: r.runId, startedAt: r.startedAt, agents: new Map(),
       log: [], answer: r.finalAnswer ?? null,
     };
-    setRunIdLabel(r.runId);
-    setPhase(r.finalAnswer ? "done" : "incomplete");
+    hideBanner();
+    setRunIdLabel(r.runId, false);
+    // failurePhase is a structured field on newer records; older ones lack it.
+    setPhase(r.finalAnswer ? "done" : r.failurePhase ? `failed: ${r.failurePhase}` : "incomplete");
     els.elapsedLbl.textContent = "";
     els.logPre.innerHTML = "";
     els.agents.innerHTML = "";
     els.taskInput.value = r.task ?? "";
 
-    // Re-create cards from saved specialistResults
+    // Re-create cards from saved specialistResults. New records carry
+    // durationMs; old ones don't — guard every new field.
     for (const s of r.specialistResults ?? []) {
       ensureAgentCard(s.agent);
-      setAgent(s.agent, { status: s.ok ? "ok" : "fail", label: s.reply.slice(0, 120), elapsed: null });
+      setAgent(s.agent, {
+        status: s.ok ? "ok" : "fail",
+        label: (s.reply ?? "").slice(0, 120),
+        elapsed: s.durationMs != null ? s.durationMs / 1000 : null,
+      });
     }
+
+    // Show a COLLAPSED log (not hidden) so a failed past run's detail is one
+    // click away instead of invisible. Populate from a saved log if present.
+    els.logPre.innerHTML = "";
+    if (Array.isArray(r.log) && r.log.length) {
+      for (const ln of r.log) appendLogLine(ln);
+    } else {
+      appendLogLine("[info ] no saved log for this run (records store the final answer + per-specialist replies).");
+    }
+    els.logSec.classList.add("collapsed");
+    els.logToggle.textContent = "expand";
 
     if (r.finalAnswer) {
       els.answerBody.textContent = r.finalAnswer;
-      showSections({ status: true, log: false, answer: true });
+      showSections({ status: true, log: true, answer: true });
     } else {
-      showSections({ status: true, log: false, answer: false });
+      showSections({ status: true, log: true, answer: false });
     }
   } catch (e) {
     appendLogLine(`[error] could not load ${runId}: ${e}`);
@@ -726,14 +809,28 @@ function isStaleEvent(payload) {
   return activeRun?.id != null && payload?.runId != null && payload.runId !== activeRun.id;
 }
 
+// Structured events drive run state (phase, cards, answer); human log lines
+// still flow to the log panel verbatim. Both are runId-filtered.
+await listen("orchestrator:event", e => {
+  if (isStaleEvent(e.payload)) return;
+  onEvent(e.payload);
+});
+
 await listen("orchestrator:line", e => {
   if (isStaleEvent(e.payload)) return;
-  parseLine(e.payload.line);
+  appendLogLine(e.payload.line);
 });
 
 await listen("orchestrator:done", e => {
   if (isStaleEvent(e.payload)) return;
-  finishRun(e.payload.exitCode);
+  finishRun(e.payload.exitCode, e.payload.waitError);
+});
+
+// Backend config-mutation warnings (gateway restart, auth copy, identity, …)
+// that used to be silently swallowed now surface as a banner.
+await listen("op:warning", e => {
+  const p = e.payload || {};
+  showBanner(`${p.op}: ${p.detail}`, p.fatal ? "error" : "warn");
 });
 
 // --- Settings modal ---
@@ -783,7 +880,7 @@ let pendingAgentChanges = {};
 // Models that actually accept an extended-thinking / reasoning-effort knob.
 // Anything not matched here gets just (default) + off — picking "high" on a
 // model that ignores it is misleading UI.
-const THINKING_LABEL = { "": "(default)", "": "(default)" };
+const THINKING_LABEL = { "": "(default)", off: "off", low: "low", medium: "medium", high: "high", max: "max (Opus only)" };
 
 function thinkingLevelsFor(modelId) {
   const m = (modelId || "").toLowerCase();
@@ -2125,6 +2222,7 @@ async function loadGroups() {
     populateGroupSelect();
   } catch (e) {
     console.error("[groups] load failed:", e);
+    showBanner(`Could not load groups: ${e}. Check ~/.crime-team/groups.json.`, "error");
   }
 }
 

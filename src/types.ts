@@ -52,16 +52,49 @@ export interface AgentCallOpts {
   thinkingLevel?: string;
   /** Called once per stdout chunk for live progress UI. */
   onProgress?: (chunk: string) => void;
+  /**
+   * Called with a human-readable warning (e.g. a thinking-level clamp) so the
+   * caller can route it through its structured logger instead of agent.ts
+   * writing to stderr directly. Keeps agent.ts decoupled from the orchestrator.
+   */
+  onWarn?: (msg: string) => void;
 }
 
 export interface AgentCallResult {
   ok: boolean;
+  /** The agent's reply (stdout only — stderr is NOT folded in; see `stderr`). */
   text: string;
+  /**
+   * Raw child stderr, kept separate so tooling noise / credential error
+   * fragments never leak into the reply, the run record, or Producer context.
+   */
+  stderr?: string;
   /** Wall-clock duration in ms. */
   durationMs: number;
   /** Exit code of the underlying process; -1 if killed by timeout. */
   exitCode: number;
 }
+
+/** One specialist's result inside a RunRecord. */
+export interface SpecialistResult {
+  agent: string;
+  reply: string;
+  ok: boolean;
+  /** Exit code of the specialist's openclaw call (-1 = timeout). */
+  exitCode?: number;
+  /** Wall-clock ms for the call (includes a retried first attempt). */
+  durationMs?: number;
+  /** True if the call timed out once and was retried. */
+  retried?: boolean;
+}
+
+/** How Producer's specialists were chosen for a run (observability provenance). */
+export type DispatchMode =
+  | "inline"
+  | "parallel"
+  | "auto-fan-out"
+  | "retry-then-fan-out"
+  | "auto-add-missing";
 
 /** Snapshot of one team-orchestrator run (saved to disk for resume). */
 export interface RunRecord {
@@ -70,9 +103,19 @@ export interface RunRecord {
   task: string;
   producerPlan?: string;
   dispatches?: DispatchBlock[];
-  specialistResults?: { agent: string; reply: string; ok: boolean }[];
+  specialistResults?: SpecialistResult[];
   finalAnswer?: string;
   endedAt?: string;
+
+  // --- observability (all optional, additive) ---
+  /** How the specialist roster was decided this run (provenance for audits). */
+  dispatchMode?: DispatchMode;
+  /** Phase where the run failed, e.g. "producer-plan" | "integrate" | "coder". */
+  failurePhase?: string;
+  /** First line / summary of why the run failed. */
+  failureReason?: string;
+  /** Set when citation verification was skipped, e.g. "no-workspace". */
+  citationCheckSkippedReason?: string;
 
   // --- G.2 / G.3 (all optional, additive) ---
   /** True when the user ticked "Use Coder" for this run. */
@@ -87,11 +130,13 @@ export interface RunRecord {
     audit: {
       producerPlan?: string;
       dispatches?: DispatchBlock[];
-      specialistResults?: { agent: string; reply: string; ok: boolean }[];
+      specialistResults?: SpecialistResult[];
       integrated?: string;
       noFindings?: boolean;
     };
     coder?: { ok: boolean; reply: string; durationMs: number };
+    /** Outcome of this iteration (distinguishes a partial entry from a done one). */
+    status?: "completed" | "audit-failed" | "clean-sentinel" | "coder-failed" | "soft-cancelled";
   }>;
   /** True when the loop stopped because an audit returned the AUDIT CLEAN sentinel. */
   loopStoppedClean?: boolean;
