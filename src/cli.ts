@@ -61,8 +61,7 @@ USAGE
   crime-team "your task"            run a fresh team task on the active group
   crime-team "..." --verbose        also print specialist replies as they arrive
   crime-team "..." --smart-dispatch Let Producer pick specialists per task
-  crime-team --group myproject "…" run on a specific group (hint only — change
-                                    active group via GUI for persistence)
+  crime-team --group myproject "…" run this one task on a specific group
 
 OPTIONS
   --verbose, -v       Print specialist replies inline
@@ -72,7 +71,8 @@ OPTIONS
   --loop <N>          Loop audit→coder up to N times (1..5), stops early on
                       AUDIT CLEAN sentinel. Only honored with --use-coder.
   --timeout <s>       Override per-call timeout in seconds
-  --group, -g <id>    Group id (defaults to activeGroupId in ~/.crime-team/groups.json)
+  --group, -g <id>    Group for this run — one-shot override, not persisted
+                      (defaults to activeGroupId in ~/.crime-team/groups.json)
   --run-id <id>       Use this id for a fresh run (record/marker/events align).
                       The desktop GUI passes its run UUID here.
   --json              Emit machine-readable NDJSON events only (one @@CTEVT@@
@@ -99,33 +99,24 @@ async function main() {
 
   if (args.help || !args.task) { printHelp(); process.exit(args.help ? 0 : 2); }
 
-  // If --group <id> was passed, swap the active group in-memory before loadConfig.
+  // --group <id> is a one-shot override for THIS run (not persisted): validate
+  // it exists, then pass it to loadConfig so it actually selects that group.
   if (args.groupId) {
     try {
       const path = join(homedir(), ".crime-team", "groups.json");
       const file = JSON.parse(readFileSync(path, "utf8")) as GroupsFile;
-      const found = file.groups.find(g => g.id === args.groupId);
-      if (!found) {
+      if (!file.groups.find(g => g.id === args.groupId)) {
         const ids = file.groups.map(g => g.id).join(", ");
         console.error(`group "${args.groupId}" not found. Available: ${ids}`);
         process.exit(2);
       }
-      // Temporarily mutate the file's activeGroupId so loadConfig picks ours.
-      file.activeGroupId = args.groupId;
-      // Persist? No — keep --group as a per-invocation override.
-      // Instead: we'll re-export a one-shot loader. For Phase A simplicity,
-      // require a separate `groups_set_active` for persistent switches; --group
-      // works for the CLI by relying on the env, since loadConfig reads the file
-      // each call. We accept the limitation that --group must coincide with the
-      // file's active group for now.
-      console.error(`note: --group ${args.groupId} acts as a hint; persistent switch via GUI.`);
     } catch (e) {
       console.error(`failed to read groups.json: ${e}`);
       process.exit(2);
     }
   }
 
-  const cfg = loadConfig();
+  const cfg = loadConfig(args.groupId);
   if (args.timeout) {
     cfg.defaultTimeoutSec = args.timeout;
     for (const k of Object.keys(cfg.perAgent)) cfg.perAgent[k]!.timeoutSec = args.timeout;

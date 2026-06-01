@@ -27,6 +27,12 @@ export interface Group {
 export interface GroupsFile {
   activeGroupId: string;
   groups: Group[];
+  /**
+   * Optional human name the Producer addresses in final answers. Global (one
+   * operator across all groups). Unset → neutral "the operator". Set it to keep
+   * a personal addressee (e.g. "Dan").
+   */
+  operatorName?: string;
 }
 
 /** A parsed DISPATCH block from Producer's output. */

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-01 — v1 release-blocker fixes (portability + multi-user)
+
+The release-readiness self-audit returned no-go on 4 hard blockers (3 single-user/single-machine leftovers + 1 irreversible bundle id). Fixed exactly those; the high/med/low tiers stay in [FOLLOWUPS.md](FOLLOWUPS.md).
+
+- **Portable root resolution.** `orchestrator_root()` (`lib.rs`) no longer hardcodes a personal path — it resolves `CRIME_TEAM_ROOT` → exe-relative → CWD walk (fixes all 7 call sites; works on any machine/checkout). `Crime-Team.ps1` uses `$PSScriptRoot`/`CRIME_TEAM_ROOT` instead of the literal path. (A bundled installer that ships `bin/crime-team.mjs` is still a follow-up — FOLLOWUPS B3.)
+- **Permanent bundle identifier.** `tauri.conf.json` `identifier` → **`com.crime-team.desktop`** (was `com.dan.crime-team`). For the NSIS target the identifier *is* the Windows uninstall/upgrade key (no separate productCode — confirmed against the Tauri v2 schema), so this is the one irreversible decision; locked before any installer ships.
+- **No hardcoded operator name.** All 12 "Dan" occurrences across 7 files are gone. The Producer's **final answer** addresses an optional global `operatorName` (top-level in `groups.json`, read by the TS engine + preserved by Rust writes) with a neutral `"the operator"` default; set `"operatorName": "Dan"` to keep a personal addressee. Setup-time meta-prompts (Rust ×4) + the wizard template use neutral wording.
+- **`--group` is a real one-shot override.** `loadActiveGroup`/`loadConfig` take an `overrideGroupId`; `cli.ts` validates then passes `--group` through (dropping the old in-memory mutation that did nothing). Selects that group for the run without persisting.
+- Tests: new Rust `orchestrator_root_honors_env_override`; `cargo test --lib` → 7, `npm test` → 28. Verified `--group` selects the right group at the config layer (what `run_started` emits) and the built engine is "Dan"-free.
+
 ## 2026-06-01 — observability overhaul (structured event stream)
 
 Acting on the orchestrator's self-run observability audit (~45 findings across the engine, the Rust shell, and the GUI). Replaced the fragile stdout string-scraping with a structured event contract and surfaced what used to fail silently.

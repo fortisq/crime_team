@@ -39,6 +39,11 @@ export interface Config {
   perGroupThinking: Record<string, Record<string, string>>;
   /** The Group object that's active. Drives dispatch + display. */
   activeGroup: Group;
+  /**
+   * Human name the Producer addresses in the final answer (from the top-level
+   * `operatorName` in groups.json). Undefined → neutral "the operator".
+   */
+  operatorName?: string;
 }
 
 const DEFAULT_PER_AGENT: Record<string, AgentConfig> = {
@@ -55,15 +60,28 @@ const GROUPS_FILE_PATH = join(homedir(), ".crime-team", "groups.json");
 /**
  * Read ~/.crime-team/groups.json and return the active group.
  * If the file is missing or empty, returns null (Phase A migration not run).
+ * `overrideGroupId` selects a specific group for this call (one-shot, e.g. the
+ * CLI's --group) without touching the on-disk activeGroupId.
  */
-export function loadActiveGroup(): Group | null {
+export function loadActiveGroup(overrideGroupId?: string): Group | null {
   try {
     const raw = readFileSync(GROUPS_FILE_PATH, "utf8");
     const parsed = JSON.parse(raw) as GroupsFile;
     if (!parsed.groups?.length) return null;
-    return parsed.groups.find(g => g.id === parsed.activeGroupId) ?? parsed.groups[0]!;
+    const targetId = overrideGroupId ?? parsed.activeGroupId;
+    return parsed.groups.find(g => g.id === targetId) ?? parsed.groups[0]!;
   } catch {
     return null;
+  }
+}
+
+/** Read the top-level operatorName from groups.json (undefined if unset/unreadable). */
+function loadOperatorName(): string | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(GROUPS_FILE_PATH, "utf8")) as GroupsFile;
+    return parsed.operatorName;
+  } catch {
+    return undefined;
   }
 }
 
@@ -105,8 +123,8 @@ function detectWorkspaceFromOpenClaw(): string {
   return "";
 }
 
-export function loadConfig(): Config {
-  const group = loadActiveGroup();
+export function loadConfig(overrideGroupId?: string): Config {
+  const group = loadActiveGroup(overrideGroupId);
   if (!group) {
     throw new Error(
       `No active group found. Expected ~/.crime-team/groups.json to exist with at ` +
@@ -138,6 +156,7 @@ export function loadConfig(): Config {
     disableCitationCheck: userOverrides.disableCitationCheck ?? false,
     perGroupThinking: userOverrides.perGroupThinking ?? {},
     activeGroup: group,
+    operatorName: loadOperatorName(),
   };
 
   return cfg;

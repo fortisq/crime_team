@@ -90,20 +90,34 @@ struct RunSummary {
     has_final: bool,
 }
 
-/// Resolve the orchestrator project root (one level up from the desktop/ subdir
-/// in dev, or alongside the .exe in release if bundled together — for v0.1 we
-/// just look up from cwd until we find bin/crime-team.mjs).
+/// Resolve the orchestrator project root — the dir containing `bin/crime-team.mjs`.
+/// Runtime-resolved (no hardcoded personal path) so it works on any machine:
+///   1. CRIME_TEAM_ROOT env var (explicit override),
+///   2. the exe dir and its parent (forward-compat with a bundled layout),
+///   3. walk up from the CWD (dev: run from anywhere in the checkout).
 fn orchestrator_root() -> PathBuf {
-    // Prefer a known absolute path baked at build time, fall back to CWD walk.
-    let known = PathBuf::from(r"C:\Users\user\Projects\crime-team-orchestrator");
-    if known.join("bin").join("crime-team.mjs").exists() {
-        return known;
+    let has_bin = |p: &std::path::Path| p.join("bin").join("crime-team.mjs").exists();
+
+    // 1. Explicit override.
+    if let Ok(root) = std::env::var("CRIME_TEAM_ROOT") {
+        let p = PathBuf::from(root);
+        if has_bin(&p) { return p; }
     }
+
+    // 2. Alongside (or one level up from) the executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if has_bin(dir) { return dir.to_path_buf(); }
+            if let Some(parent) = dir.parent() {
+                if has_bin(parent) { return parent.to_path_buf(); }
+            }
+        }
+    }
+
+    // 3. Walk up from the current working directory (dev convenience).
     let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for _ in 0..6 {
-        if cwd.join("bin").join("crime-team.mjs").exists() {
-            return cwd;
-        }
+        if has_bin(&cwd) { return cwd; }
         if !cwd.pop() { break; }
     }
     PathBuf::from(".")
@@ -411,6 +425,11 @@ struct Group {
 struct GroupsFile {
     active_group_id: String,
     groups: Vec<Group>,
+    /// Optional global operator name (the Producer's final-answer addressee).
+    /// Carried so Rust writes (e.g. groups_set_active) don't drop a user-set
+    /// value; default/skip keeps round-trip clean for files that omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_name: Option<String>,
 }
 
 fn groups_file_path() -> PathBuf {
@@ -607,7 +626,7 @@ async fn groups_scan_project(
 
     let mut prompt = String::with_capacity(20000);
     prompt.push_str(&format!(
-"You are designing an agent team for a software project. Each team has a Producer (already chosen by Dan) plus 2-5 specialists tailored to THIS project. Propose only the specialists.\n\n\
+"You are designing an agent team for a software project. Each team has a Producer (already chosen by the operator) plus 2-5 specialists tailored to THIS project. Propose only the specialists.\n\n\
 PROJECT INFO\n────────────\n\
 Display name: {display_name}\n\
 Workspace:    {workspace}\n\n\
@@ -1022,6 +1041,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
     let mut groups_file = existing.unwrap_or(GroupsFile {
         active_group_id: spec.id.clone(),
         groups: Vec::new(),
+        operator_name: None,
     });
     groups_file.groups.push(new_group.clone());
     groups_file.active_group_id = spec.id.clone();
@@ -1626,7 +1646,7 @@ async fn groups_generate_specialist_prompt(
     if existing.is_empty() { existing = "(this group has no other specialists yet)".to_string(); }
 
     let meta = format!(
-"You are the Producer for the '{display}' agent team. Dan wants to add a new specialist and needs you to draft its system prompt.
+"You are the Producer for the '{display}' agent team. The operator wants to add a new specialist and needs you to draft its system prompt.
 
 NEW SPECIALIST
 ──────────────
@@ -1794,7 +1814,7 @@ async fn groups_generate_coder_prompt(group_id: String, brief: String) -> Result
     }
 
     let meta = format!(
-"You are the Producer for the '{display}' agent team. Dan is adding a Coder
+"You are the Producer for the '{display}' agent team. The operator is adding a Coder
 agent that will receive integrated audit reports from your specialists and
 make code changes in the workspace.
 
@@ -1890,10 +1910,10 @@ async fn chat_generate_task_prompt(brief: String) -> Result<String, String> {
         .collect();
 
     let meta = format!(
-"You are the Producer for the '{display}' agent team. Dan typed a short brief in the task box and pressed 'Generate' to ask you to polish it into a proper task prompt before running.
+"You are the Producer for the '{display}' agent team. The operator typed a short brief in the task box and pressed 'Generate' to ask you to polish it into a proper task prompt before running.
 
-DAN'S BRIEF
-───────────
+OPERATOR'S BRIEF
+────────────────
 {brief}
 
 YOUR TEAM (specialists you'll dispatch to)
@@ -1902,8 +1922,8 @@ YOUR TEAM (specialists you'll dispatch to)
 
 TASK
 ────
-Rewrite Dan's brief as a complete task prompt for this team. The polished prompt should:
-  - Open with the actual goal (one or two sentences) — read-only Findings unless Dan explicitly wants code changes
+Rewrite the operator's brief as a complete task prompt for this team. The polished prompt should:
+  - Open with the actual goal (one or two sentences) — read-only Findings unless the operator explicitly wants code changes
   - State the scope clearly (which areas of the codebase, what to ignore)
   - End with a dispatch directive — \"Dispatch in parallel to every relevant specialist; synthesize into ONE integrated report.\" — so the orchestrator's full-roster enforcement engages
   - Ask for specific file:line citations (the orchestrator auto-verifies them)
@@ -1912,7 +1932,7 @@ Rewrite Dan's brief as a complete task prompt for this team. The polished prompt
 
 OUTPUT
 ──────
-Return ONLY the polished task prompt — no preamble, no explanation, no markdown fence, no quotes around the whole thing. Just the prompt text Dan will paste-or-edit and click Run.",
+Return ONLY the polished task prompt — no preamble, no explanation, no markdown fence, no quotes around the whole thing. Just the prompt text the operator will paste-or-edit and click Run.",
         display = group.display_name,
         brief = brief,
         roster = roster.join(", "),
@@ -2564,5 +2584,20 @@ mod tests {
     #[test]
     fn no_json_at_all_returns_none() {
         assert_eq!(extract_json_payload("just prose, no object here").as_deref(), None);
+    }
+
+    // orchestrator_root must be runtime-resolved (no hardcoded personal path):
+    // CRIME_TEAM_ROOT wins when it points at a dir containing bin/crime-team.mjs.
+    #[test]
+    fn orchestrator_root_honors_env_override() {
+        let tmp = std::env::temp_dir().join("ct_root_env_override_test");
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("crime-team.mjs"), b"// test").unwrap();
+        std::env::set_var("CRIME_TEAM_ROOT", &tmp);
+        let got = orchestrator_root();
+        std::env::remove_var("CRIME_TEAM_ROOT");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(got, tmp);
     }
 }

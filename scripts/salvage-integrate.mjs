@@ -64,6 +64,7 @@ if (!group) {
   process.exit(2);
 }
 const producerAgentId = group.producerAgentId;
+const operator = groups.operatorName || "the operator";
 const sessionKey = `agent:${producerAgentId}:${runId}-salvage`;
 console.log(`[salvage] producer:   ${producerAgentId}`);
 console.log(`[salvage] sessionKey: ${sessionKey}`);
@@ -135,7 +136,7 @@ function callAgent({ agentId, message, timeoutSec = 1800, thinkingLevel }) {
     ? ` Note: ${failReplies.length} specialist(s) — ${failReplies.map(r => r.agent).join(", ")} — were unavailable for this run. State that explicitly in the integration; don't invent their findings.`
     : "";
   const integratePrompt =
-    "Now integrate every specialist reply you just received into ONE coherent answer for Dan. " +
+    `Now integrate every specialist reply you just received into ONE coherent answer for ${operator}. ` +
     "Address any BLOCK / INVARIANT VIOLATION / REQ DELTA flags. Lead with the result. End with the concrete next step." +
     failedNote;
 

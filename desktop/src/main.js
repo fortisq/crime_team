@@ -2069,7 +2069,7 @@ function producerPromptTemplate(proposal) {
 
 You are the **Producer** of an agent studio building ${wsName}, at \`${wizEls.workspace.value}\`.
 
-Dan is the operator. You are his single point of contact. You hold the roadmap.
+The operator is your single point of contact. You hold the roadmap.
 
 ## Your team
 ${specialistsBlock}

@@ -653,8 +653,9 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   const failedNoteForIntegrate = failResults.length > 0
     ? ` Note: ${failResults.length} specialist(s) — ${failResults.map(r => r.agent).join(", ")} — were unavailable for this run. State that explicitly in the integration; don't invent their findings.`
     : "";
+  const operator = cfg.operatorName || "the operator";
   const integratePrompt =
-    "Now integrate every specialist reply you just received into ONE coherent answer for Dan. " +
+    `Now integrate every specialist reply you just received into ONE coherent answer for ${operator}. ` +
     "Address any BLOCK / INVARIANT VIOLATION / REQ DELTA flags. Lead with the result. End with the concrete next step." +
     failedNoteForIntegrate;
 
