@@ -380,7 +380,7 @@ async function runCoderPhase(
   if (!r.ok) {
     em.warn("coder", `Coder failed (iter ${iteration}): ${r.text.split("\n")[0]}`);
   }
-  em.event({ type: "coder", iteration, ok: r.ok, durationMs: r.durationMs, role: coderRole });
+  em.event({ type: "coder", iteration, ok: r.ok, durationMs: r.durationMs, role: coderRole, text: r.text });
   return { ok: r.ok, reply: r.text, durationMs: r.durationMs };
 }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-01 — per-iteration loop answers + Rust tracing + real per-agent emoji (FOLLOWUPS E2/E3/E6)
+
+- **E2 — per-iteration `--loop` answers.** The `coder` event now carries its report `text`, and the GUI accumulates each iteration's audit answer + Coder report as labeled sections (`═══ Audit answer — iteration N ═══` / `═══ Coder (role) ═══`) instead of the last `answer` event silently overwriting the rest. A single-answer run still renders plain; `loadRun` reconstructs the sections from a saved record's `loopIterations`.
+- **E3 — Rust structured logging.** Added `tracing` + `tracing-subscriber` with a stderr sink (timestamps + levels; level via `CRIME_TEAM_LOG`, default info), initialized in `run()`; the ad-hoc `eprintln!` diagnostics (dropped-event counter, failed `done` emit) now go through `tracing::warn!/error!`, plus a startup and `run_task` info log. In dev this surfaces in the terminal; a persistent file sink pairs with a real installer build (distribution follow-up).
+- **E6 — real per-agent emoji.** `AgentSetting` gained an `emoji` field populated from the agent's `identity.emoji` in `settings_get`; the GUI caches role→emoji on group load (`loadAgentEmojis`) and `emoji()` prefers the operator's wizard-assigned icon, falling back to the deterministic palette.
+- `npm test` → 33; `cargo build`/`cargo test --lib` → 10; GUI launches.
+
 ## 2026-06-01 — orchestration integration tests + salvage flags + copyable history runIds (FOLLOWUPS E1/E5/E7)
 
 - **E1 — integration tests for `orchestrate()`.** Added an injectable `call` to `OrchestratorOpts` (threaded through the audit helpers; defaults to the real `callAgent`) so the full flow is testable without spawning openclaw. `test/orchestrate.test.mjs` exercises the paths the audit flagged: inline answer (`dispatchMode: "inline"`), parallel dispatch + integrate (2 specialists → integrated answer), retry-on-timeout (a specialist returns exitCode −1, is retried once, recorded `retried: true`), and all-specialists-failed (exit 1, `failurePhase: "all-specialists-failed"`) — each asserting the persisted RunRecord. `npm test` → 33.

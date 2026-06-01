@@ -149,7 +149,7 @@ const EVENT_SENTINEL: &str = "@@CTEVT@@ ";
 fn note_drop(drops: &std::sync::atomic::AtomicU64) {
     let n = drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n == 1 || n % 100 == 0 {
-        eprintln!("[ct] dropped {n} orchestrator event(s) — frontend gone?");
+        tracing::warn!("dropped {n} orchestrator event(s) — frontend gone?");
     }
 }
 
@@ -331,6 +331,8 @@ async fn run_task(
         *g_slot = Some(gid);
     }
 
+    tracing::info!(run_id = %run_id, use_coder = use_coder.unwrap_or(false), loop_max = ?loop_max, "run_task spawned orchestrator");
+
     // Shared counter so a frontend that vanished mid-run leaves a trace instead
     // of silently dropping events (the done emit below is the one that un-sticks
     // the UI; its loss is logged unconditionally).
@@ -414,7 +416,7 @@ async fn run_task(
             exit_code,
             wait_error,
         }).is_err() {
-            eprintln!("[ct] orchestrator:done emit failed (exit_code={exit_code:?}) — frontend may hang");
+            tracing::error!("orchestrator:done emit failed (exit_code={exit_code:?}) — frontend may hang");
         }
     });
 
@@ -2277,6 +2279,8 @@ struct AgentSetting {
     id: String,
     primary: String,
     fallbacks: Vec<String>,
+    /// Identity emoji from the agent's openclaw identity (empty if unset).
+    emoji: String,
     /// Empty string = provider default; otherwise one of:
     /// off | minimal | low | medium | high | xhigh | adaptive | max
     thinking: String,
@@ -2363,7 +2367,10 @@ async fn settings_get(group_id: Option<String>) -> Result<SettingsSnapshot, Stri
                 }
                 _ => (String::new(), vec![]),
             };
-            agents.push(AgentSetting { id, primary, fallbacks, thinking: String::new() });
+            // Per-agent emoji lives under identity.emoji in agents.list.
+            let emoji = a.get("identity").and_then(|i| i.get("emoji"))
+                .and_then(|e| e.as_str()).unwrap_or("").to_string();
+            agents.push(AgentSetting { id, primary, fallbacks, emoji, thinking: String::new() });
         }
     }
 
@@ -2690,7 +2697,23 @@ async fn settings_test_provider(provider: String) -> Result<String, String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Initialize structured logging to stderr (timestamps + levels). Level via the
+/// CRIME_TEAM_LOG env var, default "info". In dev (`cargo tauri dev`) this shows
+/// in the terminal; a persistent file sink pairs with a real installer build
+/// (FOLLOWUPS — distribution). `try_init` so a double-init (e.g. tests) no-ops.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_env("CRIME_TEAM_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
+}
+
 pub fn run() {
+    init_tracing();
+    tracing::info!("crime-team-desktop starting");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

@@ -307,18 +307,37 @@ function agentNameFromLabel(label) {
 }
 
 const EMOJI_PALETTE = ["🧠","🛡️","🧪","📐","🗺️","🔧","🎯","🧩","📡","⚙️","🔬","🧱","🎚️","📦","🛰️"];
+// role -> the operator's wizard-assigned emoji (openclaw identity.emoji),
+// populated from settings_get on group load. Falls back to the palette below.
+const agentEmojiCache = new Map();
 function emoji(agent) {
   const role = roleOf(agent);
-  // Known stock roles keep their icon; the Coder gets a wrench; every other
-  // (wizard-created) specialist gets a STABLE distinct icon derived from its
-  // role name — far better than the old "everything not in this list is 🤖".
+  // 1) the actual per-agent emoji the operator chose, if we have it.
+  if (agentEmojiCache.has(role)) return agentEmojiCache.get(role);
+  // 2) known stock roles keep their icon; the Coder gets a wrench.
   const known = {
     producer: "🎬", architect: "🏛️", frontend: "🎨", "art-director": "🖼️", qa: "🔍", security: "🔐", coder: "🛠️",
   };
   if (known[role]) return known[role];
+  // 3) otherwise a STABLE distinct icon derived from the role name.
   let h = 0;
   for (let i = 0; i < role.length; i++) h = (h * 31 + role.charCodeAt(i)) >>> 0;
   return EMOJI_PALETTE[h % EMOJI_PALETTE.length];
+}
+
+/** Populate agentEmojiCache from settings_get for the active group. */
+async function loadAgentEmojis() {
+  agentEmojiCache.clear();
+  if (!activeGroup) return;
+  try {
+    const snap = await invoke("settings_get", { groupId: activeGroup.id });
+    const prefix = activeGroup.id + ".";
+    for (const a of snap.agents ?? []) {
+      if (!a.emoji) continue;
+      const role = a.id.startsWith(prefix) ? a.id.slice(prefix.length) : a.id;
+      agentEmojiCache.set(role, a.emoji);
+    }
+  } catch { /* fall back to palette */ }
 }
 
 function ensureAgentCard(name) {
@@ -383,6 +402,37 @@ function appendLogLine(rawLine) {
 }
 
 /**
+ * Accumulate an answer/coder section and re-render the answer panel. A single
+ * audit answer renders plain (the common case); a --loop run accumulates each
+ * iteration's audit answer + Coder report as labeled sections instead of the
+ * last one silently overwriting the rest.
+ */
+function addAnswerSection(section) {
+  if (!activeRun.sections) activeRun.sections = [];
+  activeRun.sections.push(section);
+  renderAnswerPanel();
+}
+function renderAnswerPanel() {
+  const secs = activeRun.sections || [];
+  if (!secs.length) return;
+  let body;
+  if (secs.length === 1 && secs[0].kind === "answer") {
+    body = secs[0].text; // common single-answer run — no section header
+  } else {
+    body = secs.map(s => {
+      const iter = s.iteration > 1 ? ` — iteration ${s.iteration}` : "";
+      const head = s.kind === "coder"
+        ? `═══ Coder${s.role ? ` (${s.role})` : ""}${iter} ═══`
+        : `═══ Audit answer${iter} ═══`;
+      return `${head}\n\n${s.text}`;
+    }).join("\n\n\n");
+  }
+  activeRun.answer = body; // copy / pop-out read this
+  els.answerBody.textContent = body;
+  showSections({ status: true, log: true, answer: true });
+}
+
+/**
  * Consume one structured orchestrator event. This replaced the old
  * regex-scraping of stdout: state (phase, agent cards, the answer) now comes
  * from a typed contract, so a cosmetic log-format tweak can't silently break
@@ -420,12 +470,11 @@ function onEvent(evt) {
       if (evt.agent) setAgent(evt.agent, { citations: { total: evt.total, unverified: evt.unverified, skipped: evt.skippedReason } });
       break;
     case "answer":
-      activeRun.answer = (evt.text ?? "").trim();
-      els.answerBody.textContent = activeRun.answer;
-      showSections({ status: true, log: true, answer: true });
+      addAnswerSection({ iteration: evt.iteration ?? 1, kind: "answer", text: (evt.text ?? "").trim() });
       break;
     case "coder":
       setPhase(evt.ok ? `coder done (${(evt.durationMs / 1000).toFixed(0)}s)` : "coder failed");
+      if (evt.text) addAnswerSection({ iteration: evt.iteration ?? 1, kind: "coder", role: evt.role, text: evt.text.trim() });
       break;
     case "warn":
       appendLogLine(`[warn ] ${evt.msg ?? ""}`);
@@ -688,9 +737,17 @@ async function loadRun(runId, itemEl) {
     els.logSec.classList.add("collapsed");
     els.logToggle.textContent = "expand";
 
-    if (r.finalAnswer) {
-      els.answerBody.textContent = r.finalAnswer;
-      showSections({ status: true, log: true, answer: true });
+    // Reconstruct answer sections from the record so a saved --loop run shows
+    // every iteration's audit answer + Coder report, not just the final one.
+    activeRun.sections = [];
+    if (r.finalAnswer) activeRun.sections.push({ iteration: 1, kind: "answer", text: r.finalAnswer });
+    if (r.coderResult?.reply) activeRun.sections.push({ iteration: 1, kind: "coder", role: "coder", text: r.coderResult.reply });
+    for (const it of r.loopIterations ?? []) {
+      if (it.audit?.integrated) activeRun.sections.push({ iteration: it.iteration, kind: "answer", text: it.audit.integrated });
+      if (it.coder?.reply) activeRun.sections.push({ iteration: it.iteration, kind: "coder", role: "coder", text: it.coder.reply });
+    }
+    if (activeRun.sections.length) {
+      renderAnswerPanel();
     } else {
       showSections({ status: true, log: true, answer: false });
     }
@@ -2231,6 +2288,7 @@ async function loadGroups() {
     groupsList = file.groups || [];
     activeGroup = groupsList.find(g => g.id === file.activeGroupId) ?? groupsList[0] ?? null;
     populateGroupSelect();
+    await loadAgentEmojis();
   } catch (e) {
     console.error("[groups] load failed:", e);
     showBanner(`Could not load groups: ${e}. Check ~/.crime-team/groups.json.`, "error");
@@ -2255,6 +2313,7 @@ els.groupSelect?.addEventListener("change", async () => {
     await invoke("groups_set_active", { groupId: newId });
     activeGroup = groupsList.find(g => g.id === newId) ?? null;
     // Reload everything scoped to the new active group
+    await loadAgentEmojis();
     await loadPresetsForActiveGroup();
     populatePresets();
     refreshComposerCoderUI();  // G.2/G.3 — show/hide Use Coder + Loop

@@ -32,7 +32,7 @@ export type CTEventInput =
   | { type: "retry"; iteration: number; agent: string; reason: string; baseTimeoutSec: number; bumpedTimeoutSec: number }
   | { type: "citation_check"; iteration: number; agent: string; total: number; verified: number; unverified: number; skippedReason?: string }
   | { type: "answer"; iteration: number; kind: "inline" | "integrated"; text: string }
-  | { type: "coder"; iteration: number; ok: boolean; durationMs: number; role: string }
+  | { type: "coder"; iteration: number; ok: boolean; durationMs: number; role: string; text: string }
   | { type: "warn"; phase: string; msg: string }
   | { type: "error"; phase: string; msg: string; fatal: boolean }
   | { type: "done"; ok: boolean; exitCode: number; totalMs: number; failurePhase?: string; failureReason?: string };
