@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-01 — citation guard: handle basename collisions (FOLLOWUPS D2)
+
+The hallucination guard resolved a cited `file:line` by basename and, on a collision (multiple same-named files), validated the line against an arbitrary `matches[0]` — so it could "verify" the wrong file, or falsely fail a real citation whose line happened to be out of range in the pick but valid in the intended file.
+
+- **Fixed (`src/citations.ts`):** when more than one file could be the target, `verifyCitations` now checks the cited line against **every** candidate. It returns `ambiguous-basename` (carrying the candidate count) if the line fits at least one file, and a hard `line-out-of-range` only if it fits none — so a genuine hallucination still trips the guard while a real-but-ambiguous citation isn't falsely failed. A path-qualified citation (`a/dup.ts:8`) still resolves uniquely to a clean `verified`. The report now notes how many files share the name and suggests path-qualifying.
+- Test: `basename collision: ambiguous when the line fits some candidate, hard-fail when it fits none`. `npm test` → 29.
+
 ## 2026-06-01 — config-mutation integrity (FOLLOWUPS C1/C2/C3)
 
 Hardened the registry-mutation code (the most delicate area — same as the 940 MB-incident rollback) against torn writes, lost updates, and partial failures.

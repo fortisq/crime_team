@@ -21,6 +21,8 @@ export interface VerifiedCitation extends Citation {
   status: "verified" | "ambiguous-basename" | "file-not-found" | "line-out-of-range";
   resolvedPath?: string;     // absolute path that was actually checked
   totalLines?: number;
+  /** When >1 file could be the target, how many were considered (ambiguity). */
+  ambiguousCount?: number;
 }
 
 // File extensions we treat as "could be a code citation" — used to filter the
@@ -112,23 +114,35 @@ export function verifyCitations(
     if (existsSync(exact) && statSync(exact).isFile()) {
       return checkLines(c, exact);
     }
-    // 2) Match against basename index. Path may include trailing segments.
+    // 2) Resolve by basename index. Prefer candidates whose path ends with the
+    //    cited path — a more path-qualified citation narrows the set.
     const wantedBase = basename(c.path);
     const candidates = index.get(wantedBase);
     if (!candidates || candidates.length === 0) {
       return { ...c, status: "file-not-found" };
     }
-    // Prefer candidates whose relative path ends with the cited path.
     const tail = c.path.replace(/^\.?\//, "");
-    const matches = candidates.filter(p => p.replace(/\\/g, "/").endsWith(tail));
-    const pick = matches.length === 1 ? matches[0]
-               : matches.length > 1   ? matches[0]   // ambiguous; take first
-               : candidates.length === 1 ? candidates[0]
-               : candidates[0];
-    const ambiguous = (matches.length > 1) || (matches.length === 0 && candidates.length > 1);
-    const result = checkLines(c, pick!);
-    if (ambiguous && result.status === "verified") result.status = "ambiguous-basename";
-    return result;
+    const suffixMatches = candidates.filter(p => p.replace(/\\/g, "/").endsWith(tail));
+    const considered = suffixMatches.length > 0 ? suffixMatches : candidates;
+
+    // Unambiguous: exactly one plausible file — verify directly.
+    if (considered.length === 1) {
+      return checkLines(c, considered[0]!);
+    }
+
+    // Ambiguous: >1 file could be the target. Don't trust an arbitrary pick —
+    // check the line against EVERY candidate. The citation is plausible (flagged
+    // ambiguous) iff the line fits at least one file; if it fits none, surface
+    // the failure so a genuine hallucination still trips the guard. This fixes
+    // the old behavior of validating against matches[0] (could verify the wrong
+    // file, or falsely fail when the line was valid in a different candidate).
+    const checks = considered.map(p => checkLines(c, p));
+    const hit = checks.find(r => r.status === "verified");
+    if (hit) {
+      return { ...hit, status: "ambiguous-basename", ambiguousCount: considered.length };
+    }
+    const fail = checks.find(r => r.status === "line-out-of-range") ?? checks[0]!;
+    return { ...fail, ambiguousCount: considered.length };
   });
 }
 
@@ -178,11 +192,13 @@ export function formatVerificationReport(verified: VerifiedCitation[]): string {
       ? `${v.path}:${v.lineStart}${v.lineEnd ? "-" + v.lineEnd : ""}`
       : v.path;
     if (v.status === "ambiguous-basename") {
-      lines.push(`? ${where} — basename matched but path ambiguous (resolved to ${v.resolvedPath})`);
+      const n = v.ambiguousCount ? ` (${v.ambiguousCount} files share this name — path-qualify to disambiguate)` : "";
+      lines.push(`? ${where} — basename matched but path ambiguous${n}; resolved to ${v.resolvedPath}`);
     } else if (v.status === "file-not-found") {
       lines.push(`✗ ${where} — FILE NOT FOUND in workspace`);
     } else if (v.status === "line-out-of-range") {
-      lines.push(`✗ ${where} — line out of range (file has ${v.totalLines} lines)`);
+      const scope = v.ambiguousCount ? `in all ${v.ambiguousCount} candidate files` : `(file has ${v.totalLines} lines)`;
+      lines.push(`✗ ${where} — line out of range ${scope}`);
     }
   }
   return lines.join("\n");
