@@ -26,6 +26,78 @@ struct RunState {
     /// G.3 — the group id of the currently in-flight run. Same lifecycle as
     /// current_run_id; needed to locate runs/<gid>/<runId>.cancel.
     current_group_id: Mutex<Option<String>>,
+    /// Windows Job Object (created once, KILL_ON_JOB_CLOSE) that every spawned
+    /// `node` orchestrator is assigned to. Closing the app's handle to it — on
+    /// graceful exit OR crash — makes the OS terminate the whole process tree
+    /// (node → openclaw → claude → git), so a window-close mid-run can't leave
+    /// orphans burning API tokens.
+    #[cfg(windows)]
+    job: Mutex<Option<JobHandle>>,
+}
+
+/// Owns a Windows Job Object HANDLE. Held for the app's lifetime; the kernel
+/// closes the handle when the process dies (any reason), which — with
+/// KILL_ON_JOB_CLOSE — tears down every assigned process and its descendants.
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+// A kernel HANDLE is a process-wide token, safe to move/share across threads.
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe { let _ = windows_sys::Win32::Foundation::CloseHandle(self.0); }
+    }
+}
+
+/// Create a Job Object configured to kill all member processes when its last
+/// handle closes. Returns None if the Win32 calls fail (we degrade to no-job).
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Option<JobHandle> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, SetInformationJobObject, CreateJobObjectW,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() { return None; }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 { let _ = CloseHandle(job); return None; }
+        Some(JobHandle(job))
+    }
+}
+
+/// Assign a freshly-spawned child to the run-state's kill-on-close job (creating
+/// the job on first use). Best-effort: failure just means no tree-kill guarantee.
+#[cfg(windows)]
+fn assign_child_to_job(state: &RunState, child_handle: std::os::windows::io::RawHandle) {
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    let mut slot = lock_ok(&state.job);
+    if slot.is_none() {
+        *slot = create_kill_on_close_job();
+    }
+    if let Some(j) = slot.as_ref() {
+        unsafe { let _ = AssignProcessToJobObject(j.0, child_handle as _); }
+    }
+}
+
+/// Kill the entire current process tree via the job (node + every descendant).
+/// `start_kill()` on the node child alone leaves openclaw/claude/git orphaned.
+#[cfg(windows)]
+fn terminate_job(state: &RunState) {
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+    let slot = lock_ok(&state.job);
+    if let Some(j) = slot.as_ref() {
+        unsafe { let _ = TerminateJobObject(j.0, 1); }
+    }
 }
 
 /// Lock a mutex tolerating poisoning. A panic while another thread holds the
@@ -181,6 +253,15 @@ async fn run_task(
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
 
+    // Put the node process (and thus every descendant it spawns — openclaw,
+    // claude, git) into the kill-on-close job. node spawns its first openclaw
+    // child seconds later, well after this assignment, so the whole tree is
+    // captured. From here, app exit/crash or cancel tears the tree down.
+    #[cfg(windows)]
+    if let Some(h) = child.raw_handle() {
+        assign_child_to_job(&state, h);
+    }
+
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
@@ -293,6 +374,10 @@ async fn run_task(
 
 #[tauri::command]
 async fn cancel_run(state: State<'_, Arc<RunState>>) -> Result<bool, String> {
+    // Kill the whole tree, not just node: TerminateJobObject reaps openclaw,
+    // claude, and git too. start_kill() alone would orphan those grandchildren.
+    #[cfg(windows)]
+    terminate_job(&state);
     let mut slot = lock_ok(&state.child);
     if let Some(mut c) = slot.take() {
         let _ = c.start_kill();
@@ -2502,6 +2587,19 @@ pub fn run() {
             app.manage(Arc::new(RunState::default()));
             Ok(())
         })
+        // Kill an in-flight run's process tree the instant the window closes, so
+        // a mid-run close doesn't leave node/openclaw/claude burning tokens. The
+        // kill-on-close job is the crash-proof backstop; this makes it prompt.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Some(state) = window.try_state::<Arc<RunState>>() {
+                    #[cfg(windows)]
+                    terminate_job(&state);
+                    let mut slot = lock_ok(&state.child);
+                    if let Some(mut c) = slot.take() { let _ = c.start_kill(); }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             run_task,
             cancel_run,
@@ -2599,5 +2697,31 @@ mod tests {
         std::env::remove_var("CRIME_TEAM_ROOT");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(got, tmp);
+    }
+
+    // The kill-on-close job must terminate an assigned process when the job's
+    // last handle closes — this is what reaps the orchestrator tree on app exit.
+    // (Descendants inherit the job per Windows semantics, so the tree dies too.)
+    #[cfg(windows)]
+    #[test]
+    fn kill_on_close_job_reaps_assigned_process_when_handle_drops() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        // A long-lived child (a timer keeps node's event loop alive).
+        let mut child = std::process::Command::new("node")
+            .args(["-e", "setInterval(() => {}, 1000000)"])
+            .spawn()
+            .expect("spawn node (must be on PATH)");
+        let job = create_kill_on_close_job().expect("create kill-on-close job");
+        unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _); }
+        // Closing the only job handle (simulates app exit) must kill the member.
+        drop(job);
+        let mut dead = false;
+        for _ in 0..50 {
+            if matches!(child.try_wait(), Ok(Some(_))) { dead = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !dead { let _ = child.kill(); }
+        assert!(dead, "kill-on-close job did not terminate the assigned process");
     }
 }

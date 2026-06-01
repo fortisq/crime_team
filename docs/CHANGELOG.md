@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-01 — kill orphaned subprocess tree on app exit (FOLLOWUPS A1)
+
+The top remaining audit item: closing the window (or crashing) mid-run left the `node`→`openclaw`→`claude`/`git` tree running detached, **still spending API tokens**, with no UI to find it. Even `cancel_run` only killed `node`, orphaning the grandchildren.
+
+- **Windows Job Object with `KILL_ON_JOB_CLOSE`** (`lib.rs`): a job is created on first run and every spawned `node` is assigned to it (`assign_child_to_job`). The kernel terminates all job members — node and every descendant — when the app's job handle closes, which happens on **graceful exit *or* crash**. This is the crash-proof core fix.
+- **`CloseRequested` window handler** makes the teardown prompt (kills the tree the instant the window closes), and **`cancel_run` now `TerminateJobObject`s** so a hard cancel reaps the whole tree, not just `node`.
+- Adds `windows-sys` (Windows-only dep; already in the tree). New test `kill_on_close_job_reaps_assigned_process_when_handle_drops` spawns a real `node`, assigns it, drops the handle, and asserts the OS killed it. `cargo test --lib` → 8.
+
 ## 2026-06-01 — v1 release-blocker fixes (portability + multi-user)
 
 The release-readiness self-audit returned no-go on 4 hard blockers (3 single-user/single-machine leftovers + 1 irreversible bundle id). Fixed exactly those; the high/med/low tiers stay in [FOLLOWUPS.md](FOLLOWUPS.md).
