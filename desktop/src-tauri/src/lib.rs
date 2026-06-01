@@ -531,11 +531,31 @@ fn read_groups_file() -> Result<GroupsFile, String> {
 
 fn write_groups_file(file: &GroupsFile) -> Result<(), String> {
     let path = groups_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-    }
     let pretty = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| format!("write {path:?}: {e}"))
+    atomic_write(&path, pretty.as_bytes()).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// Write a file atomically: write a sibling temp file, then rename it over the
+/// target. On Windows `rename` is an atomic replace (MoveFileEx), so a crash
+/// mid-write can never leave a truncated/half-written config registry — the
+/// target is always either the old or the new file, never a torn one.
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("config");
+    let tmp = parent.join(format!(".{fname}.tmp"));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Process-wide lock serializing config-registry read-modify-write sequences
+/// (groups.json / .crime-team.json / openclaw `agents.list`). Async so a command
+/// can hold it across its `run_openclaw` awaits. Acquire at the TOP of every
+/// mutating command — never inside read/write helpers, which would deadlock the
+/// command already holding it.
+fn config_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn active_group_id() -> Result<String, String> {
@@ -561,7 +581,8 @@ fn groups_get_active() -> Result<Group, String> {
 }
 
 #[tauri::command]
-fn groups_set_active(group_id: String) -> Result<(), String> {
+async fn groups_set_active(group_id: String) -> Result<(), String> {
+    let _cfg = config_lock().lock().await;
     let mut file = read_groups_file()?;
     if !file.groups.iter().any(|g| g.id == group_id) {
         return Err(format!("group '{group_id}' not found"));
@@ -897,6 +918,7 @@ struct CreateGroupSpec {
 /// restart the gateway. Rolls back on any failure.
 #[tauri::command]
 async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, String> {
+    let _cfg = config_lock().lock().await;
     // ─── 1. validate ─────────────────────────────────────────────────────────
     if spec.id.is_empty() || !spec.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         return Err(format!("invalid group id '{}' — must be kebab-case", spec.id));
@@ -948,6 +970,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         ids: &[String],
         dirs: &[std::path::PathBuf],
         prompts: &[std::path::PathBuf],
+        group_id: &str,
     ) {
         if let Ok(list_json) = run_openclaw(&["config", "get", "agents.list"], None).await {
             if let Ok(mut list) = serde_json::from_str::<serde_json::Value>(&list_json) {
@@ -979,6 +1002,22 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         for p in prompts {
             let _ = std::fs::remove_file(p);
         }
+        // C2: revert the LATE writes too (perGroupThinking block + starter
+        // presets dir), so a mid-create failure leaves no orphan config for a
+        // group that no longer exists. Idempotent — no-ops if not yet written.
+        let mut ct = read_crime_team_json();
+        if let Some(map) = ct.as_object_mut()
+            .and_then(|o| o.get_mut("perGroupThinking"))
+            .and_then(|m| m.as_object_mut())
+        {
+            map.remove(group_id);
+        }
+        let _ = write_crime_team_json(&ct);
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let group_dir = std::path::PathBuf::from(home)
+                .join(".crime-team").join("groups").join(group_id);
+            let _ = std::fs::remove_dir_all(group_dir);
+        }
     }
 
     // ─── 2. add each agent ───────────────────────────────────────────────────
@@ -1006,7 +1045,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
             "--agent-dir", &agent_dir_str,
         ], None).await;
         if let Err(e) = r {
-            rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+            rollback(&all_ids, &created_agent_dirs, &created_prompt_files, &spec.id).await;
             return Err(format!("agents add {qid} failed: {e}"));
         }
         created_agent_dirs.push(agent_dir.clone());
@@ -1020,7 +1059,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         // Write system prompt file
         let prompt_file = prompts_root.join(format!("{}.{}.md", spec.id, role));
         if let Err(e) = std::fs::write(&prompt_file, &agent_spec.system_prompt) {
-            rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+            rollback(&all_ids, &created_agent_dirs, &created_prompt_files, &spec.id).await;
             return Err(format!("write prompt {prompt_file:?}: {e}"));
         }
         created_prompt_files.push(prompt_file);
@@ -1079,7 +1118,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         &["config", "patch", "--stdin", "--replace-path", "agents.list"],
         Some(payload_s.as_bytes()),
     ).await {
-        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files, &spec.id).await;
         return Err(format!("patch agents.list: {e}"));
     }
 
@@ -1099,7 +1138,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
         }
     }
     if let Err(e) = write_crime_team_json(&ct) {
-        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files, &spec.id).await;
         return Err(format!(".crime-team.json write: {e}"));
     }
 
@@ -1131,7 +1170,7 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
     groups_file.groups.push(new_group.clone());
     groups_file.active_group_id = spec.id.clone();
     if let Err(e) = write_groups_file(&groups_file) {
-        rollback(&all_ids, &created_agent_dirs, &created_prompt_files).await;
+        rollback(&all_ids, &created_agent_dirs, &created_prompt_files, &spec.id).await;
         return Err(format!("write groups.json: {e}"));
     }
 
@@ -1195,6 +1234,7 @@ fn groups_get_prompt(agent_id: String) -> Result<String, String> {
 /// uses the new content on next call.
 #[tauri::command]
 async fn groups_set_prompt(agent_id: String, prompt: String) -> Result<(), String> {
+    let _cfg = config_lock().lock().await;
     let home = std::env::var("USERPROFILE").map_err(|e| format!("USERPROFILE: {e}"))?;
     let path = std::path::PathBuf::from(home).join(".openclaw").join("team-prompts").join(format!("{}.md", agent_id));
     std::fs::write(&path, &prompt).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -1233,6 +1273,7 @@ async fn groups_edit(
     emoji: Option<String>,
     workspace: Option<String>,
 ) -> Result<Group, String> {
+    let _cfg = config_lock().lock().await;
     let mut file = read_groups_file()?;
     let updated = {
         let g = file.groups.iter_mut().find(|g| g.id == group_id)
@@ -1250,9 +1291,10 @@ async fn groups_edit(
         g.last_used_at = chrono_now_iso();
         g.clone()
     };
-    write_groups_file(&file)?;
-
-    // If workspace changed, rewrite every agent's workspace in openclaw.json.
+    // C3: do the FALLIBLE openclaw patch first, then commit groups.json only on
+    // success. The old order wrote groups.json first, so a failed patch left the
+    // group pointing at the new workspace and its agents at the old one.
+    let mut restart_needed = false;
     if let Some(new_ws) = workspace.as_ref() {
         if !new_ws.trim().is_empty() {
             let mut agent_ids: Vec<String> = updated.specialists.clone();
@@ -1272,8 +1314,15 @@ async fn groups_edit(
             let payload = serde_json::json!({ "agents": { "list": list } });
             let payload_s = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
             run_openclaw(&["config", "patch", "--stdin", "--replace-path", "agents.list"], Some(payload_s.as_bytes())).await?;
-            if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
+            restart_needed = true;
         }
+    }
+
+    // Agents repointed (or no workspace change) — now commit groups.json.
+    write_groups_file(&file)?;
+
+    if restart_needed {
+        if let Err(e) = run_openclaw(&["gateway", "restart"], None).await { emit_warn(&app, "gateway restart", e); }
     }
     Ok(updated)
 }
@@ -1284,6 +1333,7 @@ async fn groups_edit(
 /// another group (or refuse if it's the last one).
 #[tauri::command]
 async fn groups_remove(app: AppHandle, group_id: String) -> Result<(), String> {
+    let _cfg = config_lock().lock().await;
     let mut file = read_groups_file()?;
     let idx = file.groups.iter().position(|g| g.id == group_id)
         .ok_or_else(|| format!("group '{group_id}' not found"))?;
@@ -1403,6 +1453,7 @@ async fn groups_remove(app: AppHandle, group_id: String) -> Result<(), String> {
 /// mirror, team-prompt file, append to group's specialists, restart gateway.
 #[tauri::command]
 async fn groups_add_specialist(app: AppHandle, group_id: String, mut spec: AgentSpec) -> Result<Group, String> {
+    let _cfg = config_lock().lock().await;
     // 0. G.1 — Coder kind branch. Apply defense-in-depth mutations BEFORE
     //    the generic validation so a sloppy caller still ends up with a
     //    well-formed Coder agent.
@@ -1580,6 +1631,7 @@ async fn groups_rename_specialist(
     old_role: String,
     new_role: String,
 ) -> Result<Group, String> {
+    let _cfg = config_lock().lock().await;
     if new_role.is_empty() || new_role.len() > 20
         || !new_role.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
         return Err(format!("invalid role id '{new_role}' — kebab-case, ≤20 chars"));
@@ -2049,6 +2101,7 @@ Return ONLY the polished task prompt — no preamble, no explanation, no markdow
 /// workspace path is never touched.
 #[tauri::command]
 async fn groups_remove_specialist(app: AppHandle, group_id: String, role: String) -> Result<Group, String> {
+    let _cfg = config_lock().lock().await;
     let mut file = read_groups_file()?;
     let idx = file.groups.iter().position(|g| g.id == group_id)
         .ok_or_else(|| format!("group '{group_id}' not found"))?;
@@ -2322,6 +2375,7 @@ async fn settings_add_provider(provider: String, profile_id: String, api_key: St
 
 #[tauri::command]
 async fn settings_set_agent_model(agent_id: String, primary: String) -> Result<(), String> {
+    let _cfg = config_lock().lock().await;
     // Read agents.list, find the agent, set its model.primary while preserving fallbacks.
     let agents_json = run_openclaw(&["config", "get", "agents.list"], None).await?;
     let mut list: serde_json::Value = serde_json::from_str(&agents_json)
@@ -2373,7 +2427,7 @@ fn read_crime_team_json() -> serde_json::Value {
 
 fn write_crime_team_json(v: &serde_json::Value) -> Result<(), String> {
     let pretty = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
-    std::fs::write(crime_team_json_path(), pretty).map_err(|e| format!("write .crime-team.json: {e}"))
+    atomic_write(&crime_team_json_path(), pretty.as_bytes()).map_err(|e| format!("write .crime-team.json: {e}"))
 }
 
 /// Set or clear an agent's thinking-level override in .crime-team.json,
@@ -2382,6 +2436,7 @@ fn write_crime_team_json(v: &serde_json::Value) -> Result<(), String> {
 /// first '.' to get group + role. Falls back to active group on unprefixed id.
 #[tauri::command]
 async fn settings_set_agent_thinking(agent_id: String, thinking: String) -> Result<(), String> {
+    let _cfg = config_lock().lock().await;
     const VALID: &[&str] = &["", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"];
     if !VALID.contains(&thinking.as_str()) {
         return Err(format!("invalid thinking level '{thinking}' — valid: {VALID:?}"));
@@ -2697,6 +2752,22 @@ mod tests {
         std::env::remove_var("CRIME_TEAM_ROOT");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(got, tmp);
+    }
+
+    // atomic_write must replace the target (incl. over an existing file) and
+    // leave no lingering temp — so a config registry is never torn/truncated.
+    #[test]
+    fn atomic_write_replaces_target_and_cleans_temp() {
+        let dir = std::env::temp_dir().join("ct_atomic_write_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("groups.json");
+        atomic_write(&target, b"{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"v\":1}");
+        // overwrite an existing target (atomic replace, not append)
+        atomic_write(&target, b"{\"v\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"v\":2}");
+        assert!(!dir.join(".groups.json.tmp").exists(), "temp file lingered");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The kill-on-close job must terminate an assigned process when the job's

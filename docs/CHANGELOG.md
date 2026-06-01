@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-01 — config-mutation integrity (FOLLOWUPS C1/C2/C3)
+
+Hardened the registry-mutation code (the most delicate area — same as the 940 MB-incident rollback) against torn writes, lost updates, and partial failures.
+
+- **C1 — atomic + serialized config writes.** `write_groups_file`/`write_crime_team_json` now go through `atomic_write` (write a sibling temp, then atomic rename over the target), so a crash mid-write can never leave a truncated `groups.json`/`.crime-team.json`. A process-wide async `config_lock()` is held for the whole of every mutating command (the 6 async `groups_*` mutators + `groups_set_active` (now async) + `groups_set_prompt` + the agent model/thinking settings commands), serializing the `read → openclaw patch → write` sequences so overlapping GUI actions can't lost-update or corrupt the registry.
+- **C2 — complete `groups_create` rollback.** On a mid-create failure the rollback now also removes the `perGroupThinking` block it wrote to `.crime-team.json` and the starter `presets/` dir (idempotent), so a failed create leaves no orphan config for a group that no longer exists.
+- **C3 — atomic `groups_edit` workspace change.** It now patches the agent workspaces in `openclaw.json` **first** and commits `groups.json` only on success — a patch failure no longer leaves the group pointing at the new workspace with its agents still on the old one.
+- Tests: new `atomic_write_replaces_target_and_cleans_temp`; `cargo test --lib` → 9. Verified the GUI still launches with the locks + async `groups_set_active`.
+
 ## 2026-06-01 — kill orphaned subprocess tree on app exit (FOLLOWUPS A1)
 
 The top remaining audit item: closing the window (or crashing) mid-run left the `node`→`openclaw`→`claude`/`git` tree running detached, **still spending API tokens**, with no UI to find it. Even `cancel_run` only killed `node`, orphaning the grandchildren.
