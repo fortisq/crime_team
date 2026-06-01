@@ -479,7 +479,7 @@ async function startRun() {
   const loopMax = (useCoder && els.loop?.checked) ? Math.max(1, Math.min(5, Number(els.loopMax.value) || 1)) : 1;
 
   try {
-    await invoke("run_task", {
+    const id = await invoke("run_task", {
       task,
       verbose: els.verbose.checked,
       smartDispatch: els.smart?.checked === true,
@@ -487,6 +487,11 @@ async function startRun() {
       useCoder,
       loopMax,
     });
+    // Pin the run id Rust minted (and passed to the orchestrator via --run-id):
+    // it lets us label the run, drop stale events from a previous/dying run,
+    // and load this exact record from history afterward.
+    activeRun.id = id;
+    setRunIdLabel(id);
   } catch (e) {
     appendLogLine(`[error] failed to start: ${e}`);
     finishRun(null);
@@ -522,6 +527,16 @@ function finishRun(exitCode) {
   els.taskInput.disabled = false;
   if (exitCode != null) {
     appendLogLine(`[info ] process exited code=${exitCode}`);
+  }
+  // Reconcile agent cards: on a non-clean exit (crash, cancel, spawn failure)
+  // any specialist still showing the spinner or "waiting…" never reported back.
+  // Mark those failed instead of leaving them spinning on the cyan dot forever.
+  if (exitCode !== 0) {
+    for (const [name, a] of activeRun.agents) {
+      if (a.status === "running" || a.status === "wait") {
+        setAgent(name, { status: "fail", label: a.label || "did not finish" });
+      }
+    }
   }
   setPhase(exitCode === 0 ? "done" : exitCode == null ? "stopped" : `exit ${exitCode}`);
   // refresh history sidebar
@@ -701,12 +716,23 @@ els.taskInput.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !els.runBtn.disabled) startRun();
 });
 
+// Drop events from any run other than the active one. After a hard cancel,
+// buffered stdout from the dying orchestrator still arrives tagged with the
+// OLD runId; without this it bleeds into the next run's log + answer buffer
+// (run A → cancel → start B → A's late lines corrupt B). activeRun.id is null
+// only in the brief window before run_task returns, during which no other run
+// can be active — so those unfiltered events are safe to accept.
+function isStaleEvent(payload) {
+  return activeRun?.id != null && payload?.runId != null && payload.runId !== activeRun.id;
+}
+
 await listen("orchestrator:line", e => {
-  const { line } = e.payload;
-  parseLine(line);
+  if (isStaleEvent(e.payload)) return;
+  parseLine(e.payload.line);
 });
 
 await listen("orchestrator:done", e => {
+  if (isStaleEvent(e.payload)) return;
   finishRun(e.payload.exitCode);
 });
 

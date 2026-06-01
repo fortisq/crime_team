@@ -18,6 +18,7 @@ interface Args {
   task?: string;
   verbose: boolean;
   resume?: string;
+  runId?: string;
   timeout?: number;
   help: boolean;
   smartDispatch: boolean;
@@ -41,6 +42,7 @@ function parseArgv(argv: string[]): Args {
       a.loopMax = n;
     }
     else if (t === "--resume") a.resume = tokens[++i];
+    else if (t === "--run-id") a.runId = tokens[++i];
     else if (t === "--timeout") a.timeout = Number(tokens[++i]);
     else if (t === "--group" || t === "-g") a.groupId = tokens[++i];
     else if (!a.task) a.task = t;
@@ -69,6 +71,8 @@ OPTIONS
                       AUDIT CLEAN sentinel. Only honored with --use-coder.
   --timeout <s>       Override per-call timeout in seconds
   --group, -g <id>    Group id (defaults to activeGroupId in ~/.crime-team/groups.json)
+  --run-id <id>       Use this id for a fresh run (record/marker/events align).
+                      The desktop GUI passes its run UUID here.
   --resume <id>       (planned) Resume an earlier run
   --help, -h          Show this
 
@@ -127,7 +131,11 @@ async function main() {
   const code = await orchestrate({
     task: args.task!,
     cfg,
-    runId: args.resume,
+    // --run-id pins a caller-chosen id for a FRESH run (the desktop GUI passes
+    // its UUID so the record + soft-cancel marker + emitted events all align).
+    // --resume reuses an id to re-run (see its caveats in README). If both are
+    // given, the explicit --run-id wins.
+    runId: args.runId ?? args.resume,
     verbose: args.verbose,
     smartDispatch: args.smartDispatch,
     useCoder: args.useCoder,

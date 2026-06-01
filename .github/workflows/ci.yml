@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  node:
+    # Builds the TypeScript engine (this also IS the typecheck — `build` is
+    # `tsc`) and runs the pure-function unit suite. Catches the log-format /
+    # regex coupling that silently breaks the GUI answer panel.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node --test
+
+  # The Rust desktop tests (extract_json_payload) run via `cargo test` locally.
+  # They are intentionally NOT in CI: a Tauri build needs system webkit libs and
+  # would make the pipeline slow and flaky for little marginal coverage. Keep the
+  # gate fast and green; run `cd desktop/src-tauri && cargo test` before shipping
+  # Rust changes.

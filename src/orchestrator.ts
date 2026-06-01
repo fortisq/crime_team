@@ -253,7 +253,7 @@ ${truncated}`;
  * line; backup heuristic matches "no findings" / "all clear" near the top with
  * no dispatch/block flags elsewhere.
  */
-function detectNoFindings(integrated: string): boolean {
+export function detectNoFindings(integrated: string): boolean {
   // Primary: exact sentinel on its own line (forgive an optional trailing period)
   const SENTINEL_RE = /^\s*AUDIT CLEAN[\s—-]+no regressions or remaining issues\.?\s*$/im;
   if (SENTINEL_RE.test(integrated)) return true;

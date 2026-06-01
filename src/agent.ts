@@ -52,7 +52,7 @@ function loadAgentModels(): Map<string, string> {
  * claude-cli with an empty stderr (silent failure, looks like a hang to the
  * orchestrator). Logs a warn to stderr when it clamps so debugging is obvious.
  */
-function clampThinking(agentId: string, thinking: string | undefined): string | undefined {
+export function clampThinking(agentId: string, thinking: string | undefined): string | undefined {
   if (!thinking || thinking === "" || thinking === "off") return thinking;
   if (thinking !== "max") return thinking;
   const model = loadAgentModels().get(agentId) ?? "";

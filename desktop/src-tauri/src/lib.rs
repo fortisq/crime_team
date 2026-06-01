@@ -88,10 +88,25 @@ async fn run_task(
         return Err(format!("crime-team.mjs not found at {}", bin.display()));
     }
 
+    // Single in-flight run: a second run_task would overwrite the child /
+    // current_run_id slots and orphan the first orchestrator (uncancelable).
+    // The UI normally guards this, but `cancel` re-enables Run while the old
+    // process may still be winding down.
+    if state.child.lock().unwrap().is_some() {
+        return Err("a run is already in progress — cancel it first".into());
+    }
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let run_id_emit = run_id.clone();
 
     let mut args: Vec<String> = vec![bin.to_string_lossy().to_string(), task];
+    // Pin the orchestrator's runId to THIS uuid so its run record, its
+    // soft-cancel marker path, and the runId on every emitted event all share
+    // one id. cli.ts maps --run-id onto orchestrate({ runId }). Without it the
+    // orchestrator minted its own `team-<epoch>` id, so GUI soft-cancel wrote a
+    // marker the orchestrator never polled (dead feature).
+    args.push("--run-id".into());
+    args.push(run_id.clone());
     if verbose { args.push("--verbose".into()); }
     if smart_dispatch.unwrap_or(false) { args.push("--smart-dispatch".into()); }
     if use_coder.unwrap_or(false) { args.push("--use-coder".into()); }
@@ -755,13 +770,44 @@ async fn groups_create(app: AppHandle, spec: CreateGroupSpec) -> Result<Group, S
     let mut created_prompt_files: Vec<std::path::PathBuf> = Vec::new();
 
     // Closure: run rollback then return the error.
+    //
+    // SAFETY: never call `openclaw agents delete` here. By this point every
+    // agent's `workspace` is already set to the user's PROJECT dir (line ~796),
+    // and `agents delete` "prunes the workspace" — it moves that real project
+    // dir to ~/.Trash. That is the exact command behind the 940 MB incident
+    // (see the long comment in groups_remove). The remove paths were hardened
+    // but this create-failure rollback path still used it. Mirror groups_remove
+    // instead: drop the entries from agents.list directly via config patch, and
+    // remove only the agent home dirs (`dirs`, which are ~/.openclaw/agents/<id>/
+    // — auth + session state, never user data).
     async fn rollback(
         ids: &[String],
         dirs: &[std::path::PathBuf],
         prompts: &[std::path::PathBuf],
     ) {
-        for id in ids {
-            let _ = run_openclaw(&["agents", "delete", id, "--yes"], None).await;
+        if let Ok(list_json) = run_openclaw(&["config", "get", "agents.list"], None).await {
+            if let Ok(mut list) = serde_json::from_str::<serde_json::Value>(&list_json) {
+                if let Some(arr) = list.as_array_mut() {
+                    // Historically `agents add` silently dashed the dotted id, so
+                    // drop both forms (matches groups_remove).
+                    let drop_set: std::collections::HashSet<String> = ids.iter()
+                        .flat_map(|id| {
+                            let dashed = id.replacen('.', "-", 1);
+                            if dashed == *id { vec![id.clone()] } else { vec![id.clone(), dashed] }
+                        })
+                        .collect();
+                    arr.retain(|a| {
+                        let cur = a.get("id").and_then(|s| s.as_str()).unwrap_or("");
+                        !drop_set.contains(cur)
+                    });
+                }
+                if let Ok(payload_s) = serde_json::to_string(&serde_json::json!({ "agents": { "list": list } })) {
+                    let _ = run_openclaw(
+                        &["config", "patch", "--stdin", "--replace-path", "agents.list"],
+                        Some(payload_s.as_bytes()),
+                    ).await;
+                }
+            }
         }
         for d in dirs {
             let _ = std::fs::remove_dir_all(d);
@@ -2399,4 +2445,50 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // extract_json_payload pulls a JSON object out of raw model output. The
+    // brace-scanner is fiddly (fences, leading chatter, braces inside strings),
+    // so pin its behavior. Run with: cd desktop/src-tauri && cargo test
+    #[test]
+    fn json_from_fenced_block() {
+        let raw = "sure, here you go:\n```json\n{\"a\": 1}\n```\nhope that helps";
+        assert_eq!(extract_json_payload(raw).as_deref(), Some("{\"a\": 1}"));
+    }
+
+    #[test]
+    fn json_from_bare_object_with_chatter() {
+        let raw = "The team is: {\"rationale\": \"x\", \"specialists\": []} — done.";
+        assert_eq!(
+            extract_json_payload(raw).as_deref(),
+            Some("{\"rationale\": \"x\", \"specialists\": []}")
+        );
+    }
+
+    #[test]
+    fn nested_braces_balance_to_the_outer_object() {
+        let raw = "{\"a\": {\"b\": {\"c\": 1}}, \"d\": 2}";
+        assert_eq!(extract_json_payload(raw).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_throw_off_the_count() {
+        // The literal "}" inside the string value must not close the object early.
+        let raw = "{\"note\": \"a closing } brace in text\", \"ok\": true}";
+        assert_eq!(extract_json_payload(raw).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn unclosed_object_returns_none() {
+        assert_eq!(extract_json_payload("{\"a\": 1, \"b\":").as_deref(), None);
+    }
+
+    #[test]
+    fn no_json_at_all_returns_none() {
+        assert_eq!(extract_json_payload("just prose, no object here").as_deref(), None);
+    }
 }
