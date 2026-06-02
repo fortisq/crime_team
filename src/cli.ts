@@ -77,7 +77,10 @@ OPTIONS
                       The desktop GUI passes its run UUID here.
   --json              Emit machine-readable NDJSON events only (one @@CTEVT@@
                       line per event); suppresses human log lines + spinner.
-  --resume <id>       (planned) Resume an earlier run
+  --resume <id>       Resume an earlier run: reuse phases that already
+                      succeeded (plan, OK specialist replies, integration,
+                      Coder, completed loop iterations) and re-run only from
+                      the first gap. Unlike --run-id, never clobbers prior work.
   --help, -h          Show this
 
 CONFIG
@@ -128,9 +131,10 @@ async function main() {
     cfg,
     // --run-id pins a caller-chosen id for a FRESH run (the desktop GUI passes
     // its UUID so the record + soft-cancel marker + emitted events all align).
-    // --resume reuses an id to re-run (see its caveats in README). If both are
-    // given, the explicit --run-id wins.
+    // --resume loads that id's saved record and continues from the first
+    // incomplete phase. If both are given, the explicit --run-id picks the id.
     runId: args.runId ?? args.resume,
+    resume: args.resume != null,
     json: args.json,
     verbose: args.verbose,
     smartDispatch: args.smartDispatch,

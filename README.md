@@ -38,6 +38,10 @@ crime-team "..." --smart-dispatch --use-coder --loop 3
 # run a different group for this one invocation (one-shot; not persisted)
 crime-team "..." --group <group-id>
 
+# resume a run that failed/was-killed: reuse the plan + OK specialist replies +
+# integrated answer + Coder + completed loop iterations; re-run only the gaps
+crime-team "..." --resume <runId>
+
 # override timeout (default 30 min per call; per-role defaults in src/config.ts)
 crime-team "..." --timeout 1800
 
@@ -173,7 +177,6 @@ The GUI launches `node bin/crime-team.mjs` under the hood — same orchestrator,
 ## What it doesn't do (yet)
 
 - **No streaming**: you wait for each agent's full reply, no token-by-token.
-- **`--resume` does not work as described**: the flag *is* wired, but it reuses the given runId, **overwrites** the existing `runs/<group-id>/<runId>.json`, and re-runs every phase from scratch — it does **not** load prior results or skip succeeded phases. Treat it as "re-run under this id," not resume. (The intended behavior — load `runs/<id>.json`, skip succeeded phases, re-run from first failure — is still unimplemented.) To simply pin a fresh run to a caller-chosen id, use `--run-id <id>` instead (this is how the GUI keeps its run id, record, and cancel marker aligned).
 - **No tool-approval gating**: agents act freely within their permitted tool profile. If you need confirm-before-write, that's a v0.2 feature.
 - **No web UI**: terminal only.
 
@@ -182,6 +185,7 @@ The GUI launches `node bin/crime-team.mjs` under the hood — same orchestrator,
 Behaviors the orchestrator enforces that aren't visible from the CLI flags — these bite if you don't know them.
 
 - **Run records live under `runs/<group-id>/<runId>.json`** — not `runs/<runId>.json`. Every run is scoped to the active group (`config.ts` → `runsDir: runs/<group-id>`). The #1 "why isn't my run showing?" cause is looking in the wrong group's subfolder.
+- **`--resume <runId>` is a real, phase-skipping resume** — not a re-run. It loads that record and reuses everything that already succeeded: the Producer plan + dispatch list, each **OK** specialist reply (only failed/missing specialists are re-dispatched — the big saving), the integrated answer (a run that died at integration re-runs zero specialists, just re-acks + re-integrates), the Coder report, and fully-completed loop iterations. It re-runs only from the first gap, and **never clobbers** a clean run (resuming a complete run is a no-op). It honors the *current* invocation's flags: resume the same run with or without `--use-coder`/`--loop` and the record reflects the resumed shape. A bare `--run-id <id>` (no `--resume`) is still the "pin a fresh run to this id" path the GUI uses. (`src/orchestrator.ts`.)
 - **Soft-cancel via a `.cancel` marker.** The GUI's Cancel (command `cancel_run_soft`) writes `runs/<group-id>/<runId>.cancel`. The orchestrator polls for it between loop iterations and before the Coder phase, then exits cleanly instead of hard-killing. CLI users can stop a `--loop` run cleanly by creating that file by hand; the orchestrator deletes it on the way out. (`src/orchestrator.ts`.) For the GUI this only works because `run_task` now passes its run UUID through as `--run-id`, so the marker it writes is the one the orchestrator polls — previously the two used different ids and GUI soft-cancel silently did nothing.
 - **Completion tombstone (`.done`) — the GUI's safety net.** When the orchestrator *process* exits, the desktop shell (not the engine) writes `runs/<group-id>/<runId>.done`. The GUI watchdog polls it (every 3 s) and finalizes the run from it if the live `orchestrator:done` event was ever dropped — so a missed event can't strand the UI on "running" forever. The GUI clears the tombstone on finish and sweeps orphans at startup; it's GUI-only and the engine never reads it. (`desktop/src-tauri/src/lib.rs`, `desktop/src/main.js`.)
 - **`.salvage/` directories are recovery dumps.** A `runs/<group-id>/<runId>.salvage/` folder holds loose-file copies of one run — `00-task.md` (the task) plus one `ok-<agent>.md` per successful specialist reply. The authoritative record is still the sibling `<runId>.json`, which already contains the task and every reply; the `.salvage/` dump is derived and safe to delete (you only lose the loose copies). To actually re-integrate a run that died mid-integration (e.g. a Defender/EPERM block in Phase 3), run `node scripts/salvage-integrate.mjs <runId>` — note it reads the **`.json` record**, *not* the `.salvage/` dir, and writes `finalAnswer` back.

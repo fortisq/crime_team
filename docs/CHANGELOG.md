@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-01 — real, phase-skipping `--resume` (was a documented no-op)
+
+`--resume <id>` was wired but did nothing useful — it just reused the id for a from-scratch run that **overwrote** the saved record (a footgun: resuming a finished run destroyed it). It now actually resumes.
+
+- **Reuse what succeeded, re-run only the gaps.** `orchestrate()` loads the saved record and skips completed phases: the Producer plan + dispatch list (skips the planning call and dispatch enforcement), each **OK** specialist reply (only failed/missing specialists are re-dispatched — a run that died at integration re-runs **zero** specialists, just re-acks + re-integrates), the integrated answer, the Coder report, and fully-completed loop iterations (replayed; the loop continues from the first incomplete one). `runAuditPhases` gained a `priorAudit` param driving the reuse; `cli.ts` passes `resume` distinctly from a bare `--run-id` pin.
+- **Never clobbers a clean run** — resuming a complete run is a no-op (every phase is individually skipped). A missing/corrupt record warns and falls back to a fresh run.
+- **Honors the resumed invocation's flags** — provenance (`usedCoder`/`loopMax`/`coderResult`/`loopIterations`) is reconciled to the current flags so an audit-only resume of a prior Coder run doesn't persist stale Coder state.
+- **Hardened against a 9-finding adversarial self-review** (3-lens review workflow → per-finding verification): require a non-empty saved plan before reuse (no empty-plan corruption); positional specialist-result merge (duplicate-role dispatches aren't collapsed); respect a reduced `--loop` on resume; reconcile the provenance flags above. (Two findings correctly skipped: the "lost completed iteration" was impossible given sequential execution; a changed `--smart-dispatch` on resume is intentionally ignored — resume continues, it doesn't re-plan.)
+- 5 new resume tests in `test/orchestrate.test.mjs` (reuse-on-integration-failure, re-run-only-failed-specialist, completed-run-no-clobber, audit-only-clears-coder-provenance, missing-record-fresh-fallback). `npm test` → 38.
+
 ## 2026-06-01 — run-completion tombstone + GUI watchdog so a dropped done event can't hang the UI (FOLLOWUPS A1b)
 
 The single `orchestrator:done` event is what un-sticks the UI when a run ends. If it was dropped (webview reload race, a listener torn down for an instant, an emit error) the GUI spun on "running" forever — the only trace was a `tracing::error!`.

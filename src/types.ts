@@ -112,6 +112,8 @@ export interface RunRecord {
   specialistResults?: SpecialistResult[];
   finalAnswer?: string;
   endedAt?: string;
+  /** Set when this run was continued via --resume (ISO of the resume). */
+  resumedAt?: string;
 
   // --- observability (all optional, additive) ---
   /** How the specialist roster was decided this run (provenance for audits). */

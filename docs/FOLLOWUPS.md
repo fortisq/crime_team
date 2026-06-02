@@ -61,7 +61,7 @@ Severity = blast radius if it bites · Effort = S (≲1h) / M (a few h) / L (a d
 These appeared in the audits but the **observability overhaul already fixed them** — recorded so they aren't re-filed:
 
 - **D4 — off-roster specialists now get cards.** The event-driven GUI calls `ensureAgentCard`/`setAgent` for any `specialist_started`/`specialist_done` agent regardless of roster (`main.js` `onEvent`), so off-roster specialists no longer sit on "waiting…" forever.
-- **D3 — `--run-id` and `--group` both work.** The GUI's run UUID flows through to the record, the soft-cancel marker, and the event stream; **`--group` is now a real one-shot override** (loadConfig override) as of the v1 blocker fixes. (`--resume`'s load-prior-results/skip-succeeded-phases behavior remains **intentionally unimplemented** and is documented as such.)
+- **D3 — `--run-id`, `--group`, and `--resume` all work.** The GUI's run UUID flows through to the record, the soft-cancel marker, and the event stream; **`--group` is a real one-shot override** (loadConfig override) as of the v1 blocker fixes; **`--resume` is now a real phase-skipping resume** (loads the saved record, reuses succeeded phases, re-runs from the first gap) as of the 2026-06-01 resume work — see [docs/CHANGELOG.md].
 - **Orchestrator↔GUI string-contract fragility** (first audit, top-5 #4) — replaced by the structured NDJSON event stream; DISPATCH parse-misses and swallowed gateway-restart/auth/identity failures now surface.
 
 ## Design deferments

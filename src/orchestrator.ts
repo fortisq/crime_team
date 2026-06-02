@@ -3,7 +3,7 @@
 // under the Windows CLI limit), integrate, optionally hand off to a Coder
 // (G.2) and optionally loop the audit→coder cycle (G.3).
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import chalk from "chalk";
@@ -19,6 +19,14 @@ export interface OrchestratorOpts {
   cfg: Config;
   /** Optional pre-existing runId (resume / GUI-pinned). */
   runId?: string;
+  /**
+   * Resume a prior run of this runId: load its saved record and skip phases
+   * that already succeeded (Producer plan, OK specialist replies, integrated
+   * answer, Coder, completed loop iterations), re-running only from the first
+   * gap. Distinct from a bare `runId` pin (which starts a FRESH run under that
+   * id and overwrites any existing record).
+   */
+  resume?: boolean;
   /** Emit machine-readable NDJSON events only (suppress human log + spinner). */
   json?: boolean;
   /** Injectable agent-call fn (defaults to the real `callAgent`). For tests. */
@@ -45,6 +53,15 @@ export interface OrchestratorOpts {
   loopMax?: number;
 }
 
+// Saved iteration-1 audit data fed back into runAuditPhases on --resume so it
+// reuses the Producer plan + OK specialist replies and re-runs only the gaps.
+interface PriorAudit {
+  producerPlan?: string;
+  dispatches?: DispatchBlock[];
+  specialistResults?: SpecialistResult[];
+  dispatchMode?: DispatchMode;
+}
+
 // Internal type returned by runAuditPhases — captures everything needed to
 // fill RunRecord (top-level fields on iter 1, loopIterations entry on iter N).
 interface AuditPhaseResult {
@@ -68,17 +85,43 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
     ?? `team-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const em = createEmitter(runId, !!opts.json);
   const call = opts.call ?? callAgent;
-  const record: RunRecord = {
-    runId,
-    startedAt: new Date().toISOString(),
-    task: opts.task,
-  };
-  if (opts.useCoder) record.usedCoder = true;
-  if (opts.loopMax && opts.loopMax > 1) record.loopMax = opts.loopMax;
 
   await mkdir(opts.cfg.runsDir, { recursive: true });
   const recordPath = join(opts.cfg.runsDir, `${runId}.json`);
   const markerPath = join(opts.cfg.runsDir, `${runId}.cancel`);
+
+  // --resume: load the saved record and continue from the first incomplete
+  // phase, reusing succeeded work. A bare runId pin (no resume) starts fresh.
+  let prior: RunRecord | undefined;
+  if (opts.resume) {
+    prior = await loadPriorRecord(recordPath);
+    if (!prior) em.warn("resume", `--resume: no saved record at ${recordPath} — starting a fresh run under this id`);
+    else em.log("info", `resume: loaded saved record for ${runId} (started ${prior.startedAt})`);
+  }
+  const task = prior?.task ?? opts.task;
+  if (prior && opts.task && opts.task.trim() && opts.task !== prior.task) {
+    em.warn("resume", `--resume: provided task differs from the saved run's — continuing with the saved task.`);
+  }
+
+  const record: RunRecord = prior
+    ? { ...prior, resumedAt: new Date().toISOString() }
+    : { runId, startedAt: new Date().toISOString(), task: opts.task };
+  // Clear stale terminal/loop markers from the prior record — we're re-running.
+  if (prior) {
+    delete record.failurePhase;
+    delete record.failureReason;
+    delete record.endedAt;
+    delete record.loopStoppedClean;
+    delete record.loopSoftCancelled;
+    // Reconcile provenance with THIS invocation's flags (the shallow copy
+    // carried the prior run's). Resuming audit-only (no --use-coder) must not
+    // leave a stale coderResult/usedCoder; resuming without a loop must not
+    // leave a stale loopMax/loopIterations claiming the loop ran.
+    if (!opts.useCoder) { delete record.usedCoder; delete record.coderResult; }
+    if (!(opts.loopMax && opts.loopMax > 1)) { delete record.loopMax; delete record.loopIterations; }
+  }
+  if (opts.useCoder) record.usedCoder = true;
+  if (opts.loopMax && opts.loopMax > 1) record.loopMax = opts.loopMax;
   // Guarded: a disk error (ENOSPC/EACCES) during a long run must not crash the
   // orchestrator — losing a mid-run checkpoint beats aborting the whole run.
   const persist = async () => {
@@ -95,7 +138,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       failurePhase: record.failurePhase, failureReason: record.failureReason });
 
   em.event({
-    type: "run_started", task: opts.task, group: opts.cfg.activeGroup.id,
+    type: "run_started", task, group: opts.cfg.activeGroup.id,
     producer: opts.cfg.producerAgent, useCoder: !!opts.useCoder,
     loopMax: opts.loopMax ?? 1, smartDispatch: !!opts.smartDispatch,
   });
@@ -117,16 +160,30 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
   // matter how we exit (success / error / soft-cancel / hard kill mid-finally).
   try {
     // --- Iteration 1: audit + (optionally) Coder ---
-    const iter1 = await runAuditPhases(opts.task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist, em, call);
-    // runAuditPhases mutates record's top-level audit fields (producerPlan,
-    // dispatches, specialistResults, finalAnswer) for iteration 1.
-    if (iter1.exitCode !== 0) {
-      record.failurePhase = iter1.failurePhase;
-      record.failureReason = iter1.failureReason;
-      record.endedAt = new Date().toISOString();
-      await persist();
-      emitDone(false, iter1.exitCode);
-      return iter1.exitCode;
+    let iter1Integrated: string;
+    if (prior && isAuditComplete(prior)) {
+      // Audit already produced a usable integrated answer — reuse it wholesale.
+      iter1Integrated = prior.finalAnswer!;
+      em.log("ok", `resume: iteration 1 audit already complete — reusing integrated answer (${(iter1Integrated.length / 1024).toFixed(1)}KB)`);
+      em.event({ type: "answer", iteration: 1, kind: "integrated", text: iter1Integrated });
+      printAnswerBanner(em, iter1Integrated);
+    } else {
+      const priorAudit: PriorAudit | undefined = prior ? {
+        producerPlan: prior.producerPlan, dispatches: prior.dispatches,
+        specialistResults: prior.specialistResults, dispatchMode: prior.dispatchMode,
+      } : undefined;
+      const iter1 = await runAuditPhases(task, opts.cfg, runId, 1, !!opts.smartDispatch, opts.verbose, record, persist, em, call, priorAudit);
+      // runAuditPhases mutates record's top-level audit fields (producerPlan,
+      // dispatches, specialistResults, finalAnswer) for iteration 1.
+      if (iter1.exitCode !== 0) {
+        record.failurePhase = iter1.failurePhase;
+        record.failureReason = iter1.failureReason;
+        record.endedAt = new Date().toISOString();
+        await persist();
+        emitDone(false, iter1.exitCode);
+        return iter1.exitCode;
+      }
+      iter1Integrated = iter1.integrated;
     }
 
     if (!opts.useCoder) {
@@ -161,9 +218,17 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       return 0;
     }
 
-    record.coderResult = await runCoderPhase(opts.task, iter1.integrated, opts.cfg, runId, 1, coderId, em, call);
+    const coderRole = roleOf(coderId, opts.cfg.activeGroup.id);
+    if (prior?.coderResult?.ok) {
+      // Coder already applied the audit successfully — reuse its report.
+      record.coderResult = prior.coderResult;
+      em.log("ok", `resume: iteration 1 Coder already succeeded — reusing its report`);
+      em.event({ type: "coder", iteration: 1, ok: true, durationMs: prior.coderResult.durationMs, role: coderRole, text: prior.coderResult.reply });
+      printCoderReport(record.coderResult, 1, coderRole, em);
+    } else {
+    record.coderResult = await runCoderPhase(task, iter1Integrated, opts.cfg, runId, 1, coderId, em, call);
     await persist();
-    printCoderReport(record.coderResult, 1, roleOf(coderId, opts.cfg.activeGroup.id), em);
+    printCoderReport(record.coderResult, 1, coderRole, em);
     if (!record.coderResult.ok) {
       record.failurePhase = "coder";
       record.failureReason = record.coderResult.reply.split("\n")[0]?.slice(0, 200);
@@ -173,13 +238,31 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
       emitDone(false, 1);
       return 1;
     }
+    }
 
     // G.3 — Loop wrapper. iter1 already happened; iter2..N are re-audits.
     const loopMax = opts.loopMax ?? 1;
     if (loopMax > 1) {
       let lastCoderReply = record.coderResult.reply;
       record.loopIterations = [];
-      for (let iter = 2; iter <= loopMax; iter++) {
+      // Resume: replay fully-completed prior loop iterations (no re-run) and
+      // continue from the first one that didn't finish. Granularity is per
+      // iteration — a partially-run iteration is re-run fresh.
+      let startIter = 2;
+      let convergedOnResume = false;
+      for (const it of prior?.loopIterations ?? []) {
+        if (it.iteration > loopMax) break; // resumed with a smaller --loop than prior ran
+        if (it.status === "completed" || it.status === "clean-sentinel") {
+          record.loopIterations.push(it);
+          if (it.coder?.reply) lastCoderReply = it.coder.reply;
+          startIter = it.iteration + 1;
+          if (it.status === "clean-sentinel") { record.loopStoppedClean = true; convergedOnResume = true; }
+        } else break;
+      }
+      if (record.loopIterations.length > 0) {
+        em.log("info", `resume: replaying ${record.loopIterations.length} completed loop iteration(s); continuing from iteration ${Math.min(startIter, loopMax + 1)}`);
+      }
+      for (let iter = startIter; !convergedOnResume && iter <= loopMax; iter++) {
         if (checkSoftCancel(markerPath)) {
           em.warn("cancel", `soft-cancel detected before iteration ${iter} — exiting cleanly`);
           record.loopSoftCancelled = true;
@@ -188,7 +271,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
 
         em.event({ type: "phase", phase: "reaudit", iteration: iter, label: `iter ${iter}/${loopMax} re-auditing changes` });
         em.log("phase", `iter ${iter}/${loopMax} re-auditing changes`);
-        const reauditTask = buildReauditTask(opts.task, lastCoderReply);
+        const reauditTask = buildReauditTask(task, lastCoderReply);
         // Fresh session keys per iteration (the runId carries an :iter${N}
         // suffix internally — see runAuditPhases). Producer's audit-phase
         // session does NOT carry across iterations to keep argv small and
@@ -228,7 +311,7 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
           break;
         }
 
-        const coderN = await runCoderPhase(opts.task, auditN.integrated, opts.cfg, runId, iter, coderId, em, call);
+        const coderN = await runCoderPhase(task, auditN.integrated, opts.cfg, runId, iter, coderId, em, call);
         iterEntry.coder = coderN;
         await persist();
         printCoderReport(coderN, iter, roleOf(coderId, opts.cfg.activeGroup.id), em);
@@ -262,6 +345,30 @@ export async function orchestrate(opts: OrchestratorOpts): Promise<number> {
  */
 function checkSoftCancel(markerPath: string): boolean {
   try { statSync(markerPath); return true; } catch { return false; }
+}
+
+/**
+ * --resume helper — load a previously-persisted run record. Returns undefined
+ * if it's missing or unparseable (the caller then falls back to a fresh run).
+ */
+async function loadPriorRecord(path: string): Promise<RunRecord | undefined> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as RunRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * --resume helper — did the audit produce a usable integrated answer? True iff
+ * finalAnswer is set AND the run didn't fail in an audit phase. (An
+ * "all-specialists-failed" record sets finalAnswer to a failure summary, so it
+ * must be excluded; a Coder-phase failure still leaves the audit complete, so
+ * resume reuses the audit and re-runs only the Coder.)
+ */
+const AUDIT_FAILURE_PHASES = new Set(["producer-plan", "all-specialists-failed", "ack", "integrate"]);
+function isAuditComplete(r: RunRecord): boolean {
+  return !!r.finalAnswer && !AUDIT_FAILURE_PHASES.has(r.failurePhase ?? "");
 }
 
 /**
@@ -405,11 +512,18 @@ async function runAuditPhases(
   persist: (() => Promise<void>) | undefined,
   em: Emitter,
   call: typeof callAgent,
+  priorAudit?: PriorAudit,
 ): Promise<AuditPhaseResult> {
   const sessionTag = iteration === 1 ? runId : `${runId}:iter${iteration}`;
   const producerSession = `agent:${cfg.producerAgent}:${sessionTag}`;
   const onWarn = (m: string) => em.warn("agent", m);
-  let dispatchMode: DispatchMode = "parallel";
+  // --resume: a saved plan (non-empty) with ≥1 dispatch lets us skip the
+  // Producer planning call and dispatch parsing/enforcement (already resolved)
+  // and go straight to reusing OK specialist replies. Require BOTH so a record
+  // with dispatches but a missing/empty plan re-plans fresh instead of
+  // persisting an empty plan.
+  const canReusePlan = !!(priorAudit?.producerPlan && priorAudit.dispatches && priorAudit.dispatches.length > 0);
+  let dispatchMode: DispatchMode = priorAudit?.dispatchMode ?? "parallel";
 
   // --- Phase 1: Producer plans ---
   em.event({ type: "phase", phase: "plan", iteration, label: "1/4 Producer planning" });
@@ -435,32 +549,38 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     else em.log("info", "smart dispatch off — Producer must follow preset's dispatch directive");
   }
 
-  const spin = em.spinner(`producer planning`);
-  const plan = await call({
-    agentId: cfg.producerAgent,
-    sessionKey: producerSession,
-    message: kickoff,
-    timeoutSec: timeoutFor(cfg, cfg.producerAgent),
-    thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
-    onWarn,
-  });
-  spin.stop(plan.ok ? "ok" : "fail", plan.durationMs);
-  if (plan.stderr) em.warn("producer", `producer stderr: ${plan.stderr.split("\n")[0].slice(0, 160)}`);
+  let plan: { ok: boolean; text: string; durationMs: number; exitCode: number; stderr?: string };
+  if (canReusePlan) {
+    plan = { ok: true, text: priorAudit!.producerPlan ?? "", durationMs: 0, exitCode: 0 };
+    em.log("info", `resume: reusing saved Producer plan + ${priorAudit!.dispatches!.length} dispatch(es) — skipping the planning call`);
+  } else {
+    const spin = em.spinner(`producer planning`);
+    plan = await call({
+      agentId: cfg.producerAgent,
+      sessionKey: producerSession,
+      message: kickoff,
+      timeoutSec: timeoutFor(cfg, cfg.producerAgent),
+      thinkingLevel: thinkingFor(cfg, cfg.producerAgent),
+      onWarn,
+    });
+    spin.stop(plan.ok ? "ok" : "fail", plan.durationMs);
+    if (plan.stderr) em.warn("producer", `producer stderr: ${plan.stderr.split("\n")[0].slice(0, 160)}`);
 
-  if (!plan.ok) {
-    em.error("producer-plan", `Producer planning failed: ${plan.text.split("\n")[0]}`);
-    if (record) record.producerPlan = plan.text;
-    if (persist) await persist();
-    return { producerPlan: plan.text, dispatches: [], specialistResults: [], integrated: "", noFindings: false,
-      failurePhase: "producer-plan", failureReason: plan.text.split("\n")[0]?.slice(0, 200), exitCode: 2 };
+    if (!plan.ok) {
+      em.error("producer-plan", `Producer planning failed: ${plan.text.split("\n")[0]}`);
+      if (record) record.producerPlan = plan.text;
+      if (persist) await persist();
+      return { producerPlan: plan.text, dispatches: [], specialistResults: [], integrated: "", noFindings: false,
+        failurePhase: "producer-plan", failureReason: plan.text.split("\n")[0]?.slice(0, 200), exitCode: 2 };
+    }
   }
   let producerPlanText = plan.text;
   if (record) record.producerPlan = producerPlanText;
   if (persist) await persist();
-  if (verbose) em.log("trace", `Producer plan:\n${plan.text}\n`);
+  if (verbose && !canReusePlan) em.log("trace", `Producer plan:\n${plan.text}\n`);
 
-  // --- Phase 2: parse + validate dispatches ---
-  let dispatches = parseDispatches(plan.text);
+  // --- Phase 2: parse + validate dispatches (reuse the saved list on resume) ---
+  let dispatches = canReusePlan ? priorAudit!.dispatches!.slice() : parseDispatches(plan.text);
   // Surface a silent parse miss: Producer clearly TRIED to dispatch (a
   // "DISPATCH:" appears) but nothing parsed — a malformed block that would
   // otherwise vanish into the auto-fan-out path with no signal.
@@ -478,8 +598,8 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
     dispatches = dispatches.filter(d => validRoles.has(roleOf(d.agent, cfg.activeGroup.id)));
   }
 
-  // --- Phase 2a: full-roster enforcement ---
-  if (!smartDispatch && hasFullRosterDirective(task) && dispatches.length > 0) {
+  // --- Phase 2a: full-roster enforcement (skipped on resume — already applied) ---
+  if (!canReusePlan && !smartDispatch && hasFullRosterDirective(task) && dispatches.length > 0) {
     const dispatchedRoles = new Set(dispatches.map(d => roleOf(d.agent, cfg.activeGroup.id)));
     const missing = fullRoster.filter(r => !dispatchedRoles.has(r));
     if (missing.length > 0) {
@@ -500,9 +620,9 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   if (record) record.dispatches = dispatches;
   if (persist) await persist();
 
-  // --- Phase 2b: enforce Smart Dispatch OFF ---
+  // --- Phase 2b: enforce Smart Dispatch OFF (skipped on resume) ---
   const taskHasDispatchDirective = hasDispatchDirective(task);
-  if (!smartDispatch && dispatches.length === 0 && taskHasDispatchDirective) {
+  if (!canReusePlan && !smartDispatch && dispatches.length === 0 && taskHasDispatchDirective) {
     em.warn("dispatch", `Producer returned 0 dispatches but task explicitly requires dispatch. Retrying with stronger nudge…`);
     const retryMsg = `You did NOT emit any DISPATCH blocks. The task above explicitly requires dispatching to specialists ("Dispatch in parallel to every relevant specialist"). The Smart Dispatch override is OFF, so you cannot answer inline. Re-read the task. Emit DISPATCH blocks now, one per specialist, in the exact format from your system prompt. Do not write any analysis or report — only the DISPATCH blocks. Available specialists: ${roster.join(", ")}.`;
     const spinR = em.spinner(`producer re-planning (forced dispatch)`);
@@ -564,10 +684,39 @@ Follow the dispatch directive in the task above. If the task says to dispatch to
   em.log("info", `Producer wants ${dispatches.length} specialist(s): ${dispatchRoles.join(", ")}`);
   if (record) record.dispatchMode = dispatchMode;
 
-  // --- Phase 3: parallel specialist dispatch ---
+  // --- Phase 3: parallel specialist dispatch (reuse OK prior replies on resume) ---
   em.event({ type: "phase", phase: "dispatch", iteration, label: "2/4 specialists running in parallel" });
   em.log("phase", "2/4 specialists running in parallel");
-  const results = await runDispatchesInParallel(dispatches, sessionTag, cfg, verbose, iteration, em, call);
+
+  // On resume, reuse a prior OK reply for a dispatch instead of re-running it;
+  // only failed/missing specialists are re-dispatched. This is the big saving —
+  // a run that died at integration re-runs zero specialists.
+  const priorOk = new Map<string, SpecialistResult>();
+  for (const s of priorAudit?.specialistResults ?? []) {
+    if (s.ok) priorOk.set(roleOf(s.agent, cfg.activeGroup.id), s);
+  }
+  const reuseRole = (d: DispatchBlock) => priorOk.get(roleOf(d.agent, cfg.activeGroup.id));
+  const reusedDispatches = dispatches.filter(reuseRole);
+  const toRun = dispatches.filter(d => !reuseRole(d));
+  if (reusedDispatches.length > 0) {
+    em.log("info", `resume: reusing ${reusedDispatches.length} prior OK specialist repl${reusedDispatches.length === 1 ? "y" : "ies"} (${reusedDispatches.map(d => roleOf(d.agent, cfg.activeGroup.id)).join(", ")}); re-running ${toRun.length}`);
+    for (const d of reusedDispatches) {
+      const role = roleOf(d.agent, cfg.activeGroup.id);
+      const ps = priorOk.get(role)!;
+      em.event({ type: "specialist_started", iteration, agent: role, label: "(reused from saved run)" });
+      em.event({ type: "specialist_done", iteration, agent: role, ok: true, durationMs: ps.durationMs ?? 0, exitCode: ps.exitCode ?? 0, retried: ps.retried ?? false });
+    }
+  }
+  const fresh = toRun.length > 0 ? await runDispatchesInParallel(toRun, sessionTag, cfg, verbose, iteration, em, call) : [];
+  // Walk dispatches in order: reused roles take their saved reply; the rest
+  // consume fresh results positionally (so duplicate roles aren't collapsed).
+  let freshIdx = 0;
+  const results: DispatchResult[] = dispatches.map(d => {
+    const role = roleOf(d.agent, cfg.activeGroup.id);
+    const ps = priorOk.get(role);
+    if (ps) return { agent: role, reply: ps.reply, ok: true, durationMs: ps.durationMs ?? 0, exitCode: ps.exitCode ?? 0, retried: ps.retried ?? false };
+    return fresh[freshIdx++];
+  });
   if (record) record.specialistResults = results.map(toSpecialistResult);
   if (persist) await persist();
 
