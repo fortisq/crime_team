@@ -4,6 +4,8 @@ Open items deferred from the two self-audits (the read-only findings report and 
 
 Two findings turned out **already resolved** by the observability event rewrite — see [Resolved this cycle](#resolved-this-cycle). A few entries are **design deferments** (deliberate decisions, not bugs) — see [Design deferments](#design-deferments).
 
+> **Status (2026-06-01):** the distribution **B-series** (real NSIS installer, portable resolution, prereq banner) is now ✅ **RESOLVED**, which closes the last *blocking* line. One small robustness follow-up remains genuinely open — **`A1b`** (a done-emit tombstone the frontend can poll if the `orchestrator:done` event is dropped). Code signing + auto-updater are deliberate [design deferments](#design-deferments), not blockers.
+
 Severity = blast radius if it bites · Effort = S (≲1h) / M (a few h) / L (a day+).
 
 ## Priority 1 — highest user / safety value
@@ -28,9 +30,9 @@ Severity = blast radius if it bites · Effort = S (≲1h) / M (a few h) / L (a d
 
 | ID | Item | Sev | Eff | Where | Fix |
 |---|---|---|---|---|---|
-| B1 | `orchestrator_root()` **hardcodes** `C:\Users\user\Projects\crime-team-orchestrator`. Move the repo and the GUI can't find `bin/crime-team.mjs` or `runs/`. | MED | S | `lib.rs:98` | Resolve from a bundled/known relative path or an env var; fall back to the CWD walk already present. |
-| B2 | Launcher `Crime-Team.ps1` runs `cargo tauri dev` (debug build needing the full Rust/Tauri toolchain). | LOW | S | `Crime-Team.ps1:6` | Ship/launch a release `.exe`; keep `dev` as a separate dev script. |
-| B3 | `bin/crime-team.mjs` (+ Node) **not bundled**; the NSIS target ships only icons, so the installer wouldn't actually run. No signing/updater. | MED | M | `tauri.conf.json:29-38` | Bundle the orchestrator via `externalBin`/`assets` (or document the Node prerequisite); decide the distribution story (dev-only vs. a real installer). |
+| B1 | ✅ **RESOLVED.** `orchestrator_root()` previously hardcoded a personal path. **Fixed** (in the v1-blocker pass, now extended): resolution chain is `CRIME_TEAM_ROOT` env → **bundled resource dir** → exe-relative → CWD walk (dev) → `"."`. The new step 2 finds the installed app's `bin/dist/node_modules` via `RESOURCE_DIR` (set in `setup()` from `app.path().resource_dir()`). Proven end-to-end against the release exe (resource_dir logged, resolves to the bundled root). | — | — | `lib.rs` `orchestrator_root`/`bundled_orchestrator_root`/`RESOURCE_DIR` | done |
+| B2 | ✅ **RESOLVED.** **Fixed:** `Crime-Team.ps1` now launches the prebuilt **release** `crime-team-desktop.exe` (no toolchain needed to run), falling back to dev only if no release build exists; `Crime-Team-Dev.ps1` is the explicit `cargo tauri dev` hot-reload script. Both resolve the repo from `$PSScriptRoot`/`CRIME_TEAM_ROOT`. | — | — | `Crime-Team.ps1`, `Crime-Team-Dev.ps1` | done |
+| B3 | ✅ **RESOLVED.** **Fixed:** `bundle.resources` now ships `bin/`, `dist/`, and `node_modules/chalk` (zero-dep) — the NSIS installer is self-contained and runs off a fresh checkout-free path (verified: 2.0 MB `Crime Team_0.1.0_x64-setup.exe`, resources stage to `_up_/_up_/`). Node + openclaw remain **external prerequisites** (the app shells out to the user's global openclaw — can't be bundled); a startup `check_prereqs` command + GUI banner surfaces either if missing. **Ships unsigned, no updater** (deliberate v1 scope) — see [Design deferments](#design-deferments). | — | — | `tauri.conf.json`, `lib.rs` `check_prereqs`, `main.js` `checkPrereqs` | done |
 
 ## Priority 4 — observability & UX polish
 
@@ -67,4 +69,5 @@ These appeared in the audits but the **observability overhaul already fixed them
 Deliberate decisions, not defects:
 
 - **GUI runs in dual mode** (Rust does *not* pass `--json`), so the log panel keeps the human lines while events drive state. `--json` is a CLI/automation convenience.
-- **Emoji** uses a deterministic per-role palette until **E6** plumbs the real per-agent emoji through `settings_get`.
+- **Emoji** uses a deterministic per-role palette until **E6** plumbs the real per-agent emoji through `settings_get`. *(E6 since resolved — palette is now the fallback.)*
+- **v1 installer ships unsigned, no auto-updater** (B3). Code signing (Azure Trusted Signing / an EV cert) and `tauri-plugin-updater` (Ed25519 keypair + hosted `latest.json`) are both real future items, but out of scope for a single-operator desktop tool — the cost/ceremony isn't worth it yet. Unsigned means a one-time SmartScreen "Run anyway"; no updater means rebuild + reinstall to upgrade. Both are easy to add later without breaking the bundle layout.

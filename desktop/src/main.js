@@ -340,6 +340,20 @@ async function loadAgentEmojis() {
   } catch { /* fall back to palette */ }
 }
 
+// Startup health check: the bundled app ships its own JS but still runs on the
+// user's Node and drives their globally-installed openclaw. On a fresh machine
+// either can be missing — surface a persistent, actionable banner instead of
+// letting the first run fail with a cryptic spawn error.
+async function checkPrereqs() {
+  let s;
+  try { s = await invoke("check_prereqs"); } catch { return; }
+  if (s.nodeOk && s.openclawOk) return;
+  const missing = [];
+  if (!s.nodeOk) missing.push("Node.js (https://nodejs.org)");
+  if (!s.openclawOk) missing.push("openclaw — run: npm install -g openclaw");
+  showBanner(`Missing prerequisite: ${missing.join("  •  ")}. Runs will fail until installed.`, "error");
+}
+
 function ensureAgentCard(name) {
   if (!activeRun.agents.has(name)) {
     activeRun.agents.set(name, { name, status: "wait", label: "", elapsed: null });
@@ -2372,4 +2386,5 @@ if (els.loopMax) {
   refreshComposerCoderUI();            // G.2/G.3 — Use Coder + Loop conditional
   try { els.rootPath.textContent = await invoke("orchestrator_path"); } catch {}
   await refreshRuns();
+  await checkPrereqs();                 // B3 — warn if Node/openclaw are missing
 })();

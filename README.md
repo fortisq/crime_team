@@ -14,7 +14,7 @@ Replaces the older PowerShell wrapper at `~/.openclaw/bin/crime-team.ps1` with a
 ## Install
 
 ```bash
-cd C:\Users\user\Projects\crime-team-orchestrator
+cd <your-checkout>   # e.g. C:\Users\you\Projects\crime-team-orchestrator
 npm install
 npm run build
 npm link            # makes `crime-team` available globally on PATH
@@ -100,25 +100,58 @@ Drop a `.crime-team.json` in your CWD to set per-group thinking levels (and, opt
 
 ## Desktop GUI
 
-A Tauri-based desktop app lives at `desktop/`. Same orchestrator, with a window:
+A Tauri-based desktop app lives at `desktop/`. Same orchestrator, with a window.
+
+### Building the installer
 
 ```powershell
-# First time only — build the .exe
-cd C:\Users\user\Projects\crime-team-orchestrator\desktop\src-tauri
-cargo build                              # ~2-3 min, debug profile
-
-# Launch the GUI
-.\target\debug\crime-team-desktop.exe    # or just double-click it
-```
-
-For a polished release build with NSIS installer:
-```powershell
-cd C:\Users\user\Projects\crime-team-orchestrator\desktop
-cargo tauri build                        # ~5-10 min, optimized + bundled
+cd <your-checkout>
+npm install ; npm run build          # builds the engine to dist/ (bundled into the app)
+cd desktop
+cargo tauri build                    # ~5-10 min, optimized + bundled
 # Output: desktop\src-tauri\target\release\bundle\nsis\Crime Team_0.1.0_x64-setup.exe
 ```
 
-What the GUI gives you over the CLI:
+`cargo tauri build` produces an **NSIS installer** that bundles the orchestrator's
+own JavaScript (`bin/`, `dist/`, `node_modules/chalk`) as Tauri resources, so the
+installed app finds `crime-team.mjs` no matter where it lands — no dev checkout
+required. Run the engine build (`npm run build`) **first**: the installer packs
+whatever is in `dist/` at build time.
+
+> **Unsigned build.** v0.1 ships without code signing, so Windows SmartScreen
+> shows "Windows protected your PC" on first run — click **More info → Run
+> anyway**. (Signing is a future item; see `docs/FOLLOWUPS.md` B-series.)
+
+### Running it
+
+- **Installed:** use the Start-menu / desktop shortcut the installer creates.
+- **From a checkout (release):** `Crime-Team.ps1` runs a prebuilt
+  `target\release\crime-team-desktop.exe` (no Rust toolchain needed to *run* it),
+  and falls back to a dev build if none exists yet.
+- **Dev (hot reload):** `Crime-Team-Dev.ps1` runs `cargo tauri dev` — needs the
+  full Rust + Tauri toolchain.
+
+Both launchers resolve the repo from `$PSScriptRoot` (or `CRIME_TEAM_ROOT` if set)
+— no hardcoded personal path.
+
+### Prerequisites on the target machine
+
+The bundle ships the orchestrator's JS, but it still **runs on the user's Node**
+and **drives their globally-installed `openclaw`** — neither can be bundled. On a
+fresh machine, install both:
+
+```powershell
+# Node.js 18+  →  https://nodejs.org
+npm install -g openclaw
+```
+
+On startup the app probes for both and shows a **persistent banner** with install
+instructions if either is missing, instead of letting the first run fail with a
+cryptic spawn error. (If `node` isn't on PATH — nvm/Volta/fnm — set
+`CRIME_TEAM_NODE=<full path to node>`.)
+
+### What the GUI gives you over the CLI
+
 - Persistent **run history sidebar** (loads the active group's `runs/<group-id>/*.json` automatically)
 - **Live per-agent status cards** (spinner per running specialist, ok/fail when done)
 - **Live log panel** with colorized info/phase/ok/warn/error

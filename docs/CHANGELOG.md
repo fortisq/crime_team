@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-01 — real NSIS installer: bundle the orchestrator, portable resolution, prereq banner (FOLLOWUPS B1/B2/B3)
+
+The desktop app can now be installed and run on a machine that isn't the dev checkout. **Ships unsigned, no auto-updater, graceful prerequisite check** (deliberate v1 scope).
+
+- **B3 — bundle the orchestrator.** `tauri.conf.json` `bundle.resources` now ships the engine's own JS — `bin/`, `dist/`, and `node_modules/chalk` (chalk is zero-dep, so it's self-contained). The NSIS installer is therefore self-running; verified it produces a lean **2.0 MB** `Crime Team_0.1.0_x64-setup.exe`. (WebView2 is a system runtime, not bundled; **Node + openclaw stay external** — the app shells out to the user's global openclaw, which can't be bundled.)
+- **B1 — portable resolution.** `orchestrator_root()` gained a **bundled-resources** step: `RESOURCE_DIR` (a `OnceLock` set in `setup()` from `app.path().resource_dir()`) → the extracted, unit-tested `bundled_orchestrator_root()` finds `bin/dist/node_modules`. Tauri encodes the `../../` resource prefix as `_up_/_up_`, so the bundled root is `<resource_dir>/_up_/_up_/` — checked first, with a flattened fallback. Proven against the **release exe** from a neutral CWD: the tracing log shows `resource_dir = …\target\release`, and resolution lands on the bundled root via that branch (not the dev CWD-walk). Full chain: `CRIME_TEAM_ROOT` → bundled → exe-relative → CWD walk → `"."`.
+- **B3 — graceful prereq check.** New `check_prereqs` Tauri command probes Node (`node --version`) + openclaw (`openclaw.mjs` presence); the GUI calls it on startup (`checkPrereqs`) and shows a **persistent banner** with install instructions (`npm install -g openclaw`, nodejs.org) if either is missing — instead of letting the first run die at spawn. Confirmed no banner fires when both are present.
+- **B2 — release-first launcher.** `Crime-Team.ps1` now runs the prebuilt `target\release\crime-team-desktop.exe` (no Rust toolchain needed to *run* it), falling back to dev only if no release build exists; `Crime-Team-Dev.ps1` is the explicit `cargo tauri dev` hot-reload script. Both resolve the repo from `$PSScriptRoot`/`CRIME_TEAM_ROOT`.
+- **Unsigned + no updater** are documented as design deferments (one-time SmartScreen "Run anyway"; rebuild-to-upgrade). README's Desktop GUI section rewritten with build/run/prereq guidance.
+- New test `bundled_root_resolves_up_up_and_flat_layouts`. `cargo test --lib` → 11; `npm test` → 33; release build + installer produced; release GUI launches and resolves via the bundle.
+
 ## 2026-06-01 — per-iteration loop answers + Rust tracing + real per-agent emoji (FOLLOWUPS E2/E3/E6)
 
 - **E2 — per-iteration `--loop` answers.** The `coder` event now carries its report `text`, and the GUI accumulates each iteration's audit answer + Coder report as labeled sections (`═══ Audit answer — iteration N ═══` / `═══ Coder (role) ═══`) instead of the last `answer` event silently overwriting the rest. A single-answer run still renders plain; `loadRun` reconstructs the sections from a saved record's `loopIterations`.

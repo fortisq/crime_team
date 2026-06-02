@@ -218,8 +218,28 @@ struct RunSummary {
 ///   1. CRIME_TEAM_ROOT env var (explicit override),
 ///   2. the exe dir and its parent (forward-compat with a bundled layout),
 ///   3. walk up from the CWD (dev: run from anywhere in the checkout).
+/// Set once at app setup to the Tauri resource dir (where `bundle.resources` —
+/// bin/, dist/, node_modules/chalk — land in an installed app).
+static RESOURCE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn has_orchestrator_bin(p: &std::path::Path) -> bool {
+    p.join("bin").join("crime-team.mjs").exists()
+}
+
+/// Given Tauri's resource dir, locate the bundled orchestrator root if present.
+/// Tauri encodes the `../../` prefix in `bundle.resources` as `_up_/_up_`, so
+/// bin/dist/node_modules land at `<resource_dir>/_up_/_up_/`. We check that
+/// first, then the bare resource_dir (forward-compat if the layout is ever
+/// flattened). Pure (path-in → path-out) so it can be unit-tested.
+fn bundled_orchestrator_root(resource_dir: &std::path::Path) -> Option<PathBuf> {
+    let bundled = resource_dir.join("_up_").join("_up_");
+    if has_orchestrator_bin(&bundled) { return Some(bundled); }
+    if has_orchestrator_bin(resource_dir) { return Some(resource_dir.to_path_buf()); }
+    None
+}
+
 fn orchestrator_root() -> PathBuf {
-    let has_bin = |p: &std::path::Path| p.join("bin").join("crime-team.mjs").exists();
+    let has_bin = has_orchestrator_bin;
 
     // 1. Explicit override.
     if let Ok(root) = std::env::var("CRIME_TEAM_ROOT") {
@@ -227,7 +247,12 @@ fn orchestrator_root() -> PathBuf {
         if has_bin(&p) { return p; }
     }
 
-    // 2. Alongside (or one level up from) the executable.
+    // 2. Bundled resources (installed app).
+    if let Some(rd) = RESOURCE_DIR.get() {
+        if let Some(root) = bundled_orchestrator_root(rd) { return root; }
+    }
+
+    // 3. Alongside (or one level up from) the executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             if has_bin(dir) { return dir.to_path_buf(); }
@@ -2658,6 +2683,42 @@ async fn settings_claude_cli_status() -> Result<ClaudeCliStatus, String> {
     Ok(ClaudeCliStatus { installed: true, version, path: Some(claude_path) })
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PrereqStatus {
+    /// `node` is callable (CRIME_TEAM_NODE or PATH).
+    node_ok: bool,
+    node_version: Option<String>,
+    /// openclaw.mjs is present where we'd shell out to it.
+    openclaw_ok: bool,
+    openclaw_path: String,
+}
+
+/// Check the external runtimes the installed app shells out to: Node and the
+/// global `openclaw` package. The bundle ships the orchestrator's own JS, but
+/// it still runs on the user's Node and drives their globally-installed
+/// openclaw — neither can be bundled — so a fresh machine may be missing them.
+/// The GUI calls this on startup and shows an install banner if either is gone.
+#[tauri::command]
+async fn check_prereqs() -> PrereqStatus {
+    let node = node_bin();
+    let node_version = match tokio::process::Command::new(&node).arg("--version").output().await {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
+    };
+    let (_node, openclaw) = openclaw_bin();
+    let openclaw_ok = std::path::Path::new(&openclaw).exists();
+    PrereqStatus {
+        node_ok: node_version.is_some(),
+        node_version,
+        openclaw_ok,
+        openclaw_path: openclaw,
+    }
+}
+
 /// Try a 1-token inference against the named provider's representative model.
 /// Returns the model's reply on success; returns a stripped error on failure.
 #[tauri::command]
@@ -2718,6 +2779,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(Arc::new(RunState::default()));
+            // Remember where the bundled orchestrator (bin/dist/node_modules)
+            // lives so orchestrator_root() can find it in an installed app.
+            if let Ok(rd) = app.path().resource_dir() {
+                tracing::info!(resource_dir = %rd.display(), "resolved resource dir");
+                let _ = RESOURCE_DIR.set(rd);
+            }
             Ok(())
         })
         // Kill an in-flight run's process tree the instant the window closes, so
@@ -2747,6 +2814,7 @@ pub fn run() {
             settings_remove_provider,
             settings_test_provider,
             settings_claude_cli_status,
+            check_prereqs,
             settings_set_agent_thinking,
             groups_list,
             groups_get_active,
@@ -2830,6 +2898,39 @@ mod tests {
         std::env::remove_var("CRIME_TEAM_ROOT");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(got, tmp);
+    }
+
+    // The installed app finds its orchestrator under Tauri's `_up_/_up_`
+    // resource layout (the `../../` in bundle.resources). Pin both the nested
+    // layout and the flattened-fallback so a layout change can't silently break
+    // resolution on a machine that isn't a dev checkout.
+    #[test]
+    fn bundled_root_resolves_up_up_and_flat_layouts() {
+        let pid = std::process::id();
+        // Nested: <rd>/_up_/_up_/bin/crime-team.mjs  (the real bundle shape)
+        let rd = std::env::temp_dir().join(format!("ct_bundle_nested_{pid}"));
+        let nested_bin = rd.join("_up_").join("_up_").join("bin");
+        std::fs::create_dir_all(&nested_bin).unwrap();
+        std::fs::write(nested_bin.join("crime-team.mjs"), b"// test").unwrap();
+        assert_eq!(
+            bundled_orchestrator_root(&rd),
+            Some(rd.join("_up_").join("_up_"))
+        );
+        let _ = std::fs::remove_dir_all(&rd);
+
+        // Flattened fallback: <rd>/bin/crime-team.mjs
+        let rd2 = std::env::temp_dir().join(format!("ct_bundle_flat_{pid}"));
+        let flat_bin = rd2.join("bin");
+        std::fs::create_dir_all(&flat_bin).unwrap();
+        std::fs::write(flat_bin.join("crime-team.mjs"), b"// test").unwrap();
+        assert_eq!(bundled_orchestrator_root(&rd2), Some(rd2.clone()));
+        let _ = std::fs::remove_dir_all(&rd2);
+
+        // Neither present → None (so orchestrator_root falls through to CWD walk)
+        let rd3 = std::env::temp_dir().join(format!("ct_bundle_none_{pid}"));
+        std::fs::create_dir_all(&rd3).unwrap();
+        assert_eq!(bundled_orchestrator_root(&rd3), None);
+        let _ = std::fs::remove_dir_all(&rd3);
     }
 
     // atomic_write must replace the target (incl. over an existing file) and
