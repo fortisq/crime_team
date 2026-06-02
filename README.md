@@ -112,6 +112,18 @@ Drop a `.crime-team.json` in your CWD to set per-group thinking levels (and, opt
 - OpenClaw installed with the active group's team configured. The dispatched roster is whatever is in that group's `specialists[]` in `~/.crime-team/groups.json` and **varies per project** (a typical roster is the producer plus a handful of specialists, e.g. architect / frontend / art-director / qa / security). The 6 names in `src/config.ts` `DEFAULT_PER_AGENT` are **timeout fallbacks only**, not the dispatch list — editing them does not change who runs. See `~\.openclaw\team-prompts\HOW-TO.md`.
 - OpenClaw is invoked as `node openclaw.mjs` directly — **not** the `.cmd` shim (which `spawn` can't launch on Windows: `shell:false` → EINVAL). The default is `%APPDATA%\npm\node_modules\openclaw\openclaw.mjs`; override the path with `OPENCLAW_BIN=<path-to-openclaw.mjs>`.
 
+### Troubleshooting: `spawn claude ENOENT` (Windows)
+
+If a run reaches the Producer then fails with `GatewayClientRequestError: Error: spawn claude ENOENT` even though `claude` works in your terminal: openclaw's gateway spawns the `claude-cli` backend's `command` (default `"claude"`) with `shell:false`, and on Windows that can't resolve the npm `claude.cmd`/`.ps1` shims — there's no bare `claude.exe` on PATH. Point the backend at the real exe in `~/.openclaw/openclaw.json` and restart the gateway:
+
+```json
+{ "agents": { "defaults": { "cliBackends": { "claude-cli": {
+  "command": "C:/Users/<you>/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+} } } } }
+```
+
+The gateway is a daemon (Windows scheduled task **"OpenClaw Gateway"**, port **18789**); if `openclaw gateway restart` reports "port still busy", restart it with `schtasks /End /TN "OpenClaw Gateway"` then `schtasks /Run /TN "OpenClaw Gateway"`, and wait for `openclaw gateway status` to report **write-capable**.
+
 ## Desktop GUI
 
 A Tauri-based desktop app lives at `desktop/`. Same orchestrator, with a window.
