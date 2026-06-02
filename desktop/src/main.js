@@ -591,7 +591,9 @@ async function startRun() {
     // it lets us label the run, drop stale events from a previous/dying run,
     // and load this exact record from history afterward.
     activeRun.id = id;
+    activeRun.groupId = activeGroup?.id ?? null;   // A1b — pin the run's group for the watchdog
     setRunIdLabel(id, true);
+    startDoneWatchdog(id, activeRun.groupId);       // recover if the live done event is dropped
   } catch (e) {
     appendLogLine(`[error] failed to start: ${e}`);
     showBanner(`Failed to start run: ${e}`, "error");
@@ -625,7 +627,40 @@ async function cancelRun() {
   }
 }
 
+// A1b — completion watchdog. The single `orchestrator:done` event is what
+// un-sticks the UI when a run ends; if it's dropped (webview reload race, a
+// listener torn down for an instant, an emit error) the UI would spin forever.
+// While a run is live we poll for the durable tombstone Rust writes on process
+// exit (`run_done_status`) and finalize from it if the live event never came.
+let doneWatchdog = null;
+function startDoneWatchdog(runId, groupId) {
+  stopDoneWatchdog();
+  const tick = async () => {
+    // Only watch the current, still-running run.
+    if (!activeRun || activeRun.id !== runId || activeRun.finished) { stopDoneWatchdog(); return; }
+    let tomb;
+    // Pin the group the run launched under so a mid-run group switch can't
+    // point the poll at the wrong dir.
+    try { tomb = await invoke("run_done_status", { runId, groupId: groupId ?? null }); }
+    catch { return; }            // transient (command error) — retry next tick
+    if (!tomb) return;           // process still running, no tombstone yet
+    // The orchestrator process exited but we never got orchestrator:done.
+    if (activeRun && activeRun.id === runId && !activeRun.finished) {
+      appendLogLine("[warn ] completion event was missed — recovered via watchdog");
+      finishRun(tomb.exitCode ?? null, tomb.waitError ?? null);
+    }
+  };
+  tick();                          // immediate check — catch an instant exit before the first interval
+  doneWatchdog = setInterval(tick, 3000);
+}
+function stopDoneWatchdog() { if (doneWatchdog) { clearInterval(doneWatchdog); doneWatchdog = null; } }
+
 function finishRun(exitCode, waitError) {
+  // Idempotent (A1b): the watchdog and a late live `orchestrator:done` can both
+  // arrive — only the first call finalizes; the rest no-op.
+  if (activeRun?.finished) return;
+  if (activeRun) activeRun.finished = true;
+  stopDoneWatchdog();
   stopElapsedTimer();
   els.runBtn.disabled = false;
   els.cancelBtn.disabled = true;
@@ -669,6 +704,10 @@ function finishRun(exitCode, waitError) {
   setPhase(exitCode === 0 ? "done" : waitError ? "error (internal)" : exitCode == null ? "stopped" : describeExit(exitCode));
   // refresh history sidebar
   refreshRuns();
+  // A1b — the run is fully finalized; drop its completion tombstone so they
+  // don't accumulate. Fire-and-forget; idempotent on the Rust side. (A crash
+  // before this lands is swept on next startup.)
+  if (activeRun?.id) invoke("clear_run_done", { runId: activeRun.id, groupId: activeRun.groupId ?? null }).catch(() => {});
 }
 
 // --- history ---
@@ -712,13 +751,17 @@ async function refreshRuns() {
 }
 
 async function loadRun(runId, itemEl) {
+  // A1b — viewing a historical run: stop watching any live run we're navigating
+  // away from, and mark the loaded record `finished` so the watchdog/a stray
+  // late event can never re-finalize this static view.
+  stopDoneWatchdog();
   document.querySelectorAll(".run-item.active").forEach(el => el.classList.remove("active"));
   itemEl?.classList.add("active");
   try {
     const r = await invoke("get_run", { runId });
     activeRun = {
       id: r.runId, startedAt: r.startedAt, agents: new Map(),
-      log: [], answer: r.finalAnswer ?? null,
+      log: [], answer: r.finalAnswer ?? null, finished: true,
     };
     hideBanner();
     setRunIdLabel(r.runId, false);
@@ -2387,4 +2430,5 @@ if (els.loopMax) {
   try { els.rootPath.textContent = await invoke("orchestrator_path"); } catch {}
   await refreshRuns();
   await checkPrereqs();                 // B3 — warn if Node/openclaw are missing
+  invoke("sweep_done_tombstones").catch(() => {});  // A1b — clear orphaned tombstones from a prior session
 })();

@@ -426,6 +426,9 @@ async fn run_task(
         } else {
             (None, None)
         };
+        // Capture the active group id BEFORE clearing it — the tombstone path
+        // is runs/<group-id>/<run_id>.done.
+        let group_id = lock_ok(&state_done.current_group_id).clone().unwrap_or_default();
         // G.3 — clear current_run_id + current_group_id now that the run is done.
         {
             let mut s = lock_ok(&state_done.current_run_id);
@@ -435,13 +438,18 @@ async fn run_task(
             let mut s = lock_ok(&state_done.current_group_id);
             *s = None;
         }
-        // The done event un-sticks the UI — always log if it's lost.
+        // A1b — write the durable completion tombstone BEFORE emitting, so it's
+        // already on disk by the time the frontend could act on (or miss) the
+        // live event. If the event is lost, the GUI watchdog polls this file.
+        write_done_tombstone(&group_id, &id_done, exit_code, wait_error.as_deref());
+        // The done event un-sticks the UI — always log if it's lost (the
+        // tombstone above is the recovery path when it is).
         if app_done.emit("orchestrator:done", RunDone {
             run_id: id_done,
             exit_code,
             wait_error,
         }).is_err() {
-            tracing::error!("orchestrator:done emit failed (exit_code={exit_code:?}) — frontend may hang");
+            tracing::error!("orchestrator:done emit failed (exit_code={exit_code:?}) — frontend may hang; wrote tombstone for watchdog recovery");
         }
     });
 
@@ -499,6 +507,48 @@ fn active_group_id_for_state() -> Result<String, String> {
     Ok(file.active_group_id)
 }
 
+/// Build a per-run artifact path under an explicit runs root:
+/// `<runs_root>/<group-id>/<run_id>.<ext>` (or `<runs_root>/<run_id>.<ext>`
+/// when no group is active). Pure — split out so it's unit-testable without
+/// touching `orchestrator_root()` / global state.
+fn run_artifact_path_in(runs_root: &std::path::Path, group_id: &str, run_id: &str, ext: &str) -> PathBuf {
+    let dir = if group_id.is_empty() { runs_root.to_path_buf() } else { runs_root.join(group_id) };
+    dir.join(format!("{run_id}.{ext}"))
+}
+
+/// `runs/<group-id>/<run_id>.<ext>` under the resolved orchestrator root —
+/// the same layout as the run record (`.json`) and the soft-cancel marker (`.cancel`).
+fn run_artifact_path(group_id: &str, run_id: &str, ext: &str) -> PathBuf {
+    run_artifact_path_in(&orchestrator_root().join("runs"), group_id, run_id, ext)
+}
+
+/// Serialize the A1b completion-tombstone body. Pure, for testability.
+fn done_tombstone_body(run_id: &str, exit_code: Option<i32>, wait_error: Option<&str>) -> String {
+    serde_json::json!({
+        "runId": run_id,
+        "exitCode": exit_code,
+        "waitError": wait_error,
+    })
+    .to_string()
+}
+
+/// A1b — write a durable run-completion tombstone next to the run record:
+/// `runs/<group-id>/<run_id>.done`. The Rust done-handler fires when the
+/// orchestrator *process* exits — regardless of whether it managed to write a
+/// clean record — so this is the authoritative "the run ended" signal that a
+/// frontend which missed the live `orchestrator:done` event can poll
+/// (`run_done_status`) to un-stick its UI.
+fn write_done_tombstone(group_id: &str, run_id: &str, exit_code: Option<i32>, wait_error: Option<&str>) {
+    let path = run_artifact_path(group_id, run_id, "done");
+    // Atomic write (sibling temp + rename, creating the dir): the GUI watchdog
+    // polls this file, so it must never observe a half-written/torn JSON — the
+    // rename makes it appear all-at-once and visible to the next read. (Durable
+    // fsync isn't needed; the tombstone is transient.)
+    if let Err(e) = atomic_write(&path, done_tombstone_body(run_id, exit_code, wait_error).as_bytes()) {
+        tracing::warn!("failed to write done tombstone {}: {e}", path.display());
+    }
+}
+
 #[tauri::command]
 fn list_runs() -> Result<Vec<RunSummary>, String> {
     let root = orchestrator_root();
@@ -551,6 +601,77 @@ fn get_run(run_id: String) -> Result<serde_json::Value, String> {
         }
     }
     Err(format!("run not found in any of: {candidates:?}"))
+}
+
+/// A1b — poll for a run's completion tombstone (`runs/<group-id>/<run_id>.done`).
+/// Returns the parsed tombstone (`{ runId, exitCode, waitError }`) once the
+/// orchestrator process has exited, else `null`. The GUI watchdog polls this so
+/// a dropped `orchestrator:done` event can't strand the UI on "running" forever.
+///
+/// `group_id` is the group the run was *launched* under (the GUI pins and passes
+/// it) — so a mid-run active-group switch can't send the poll to the wrong dir.
+/// Falls back to the current active group, then the flat/legacy path.
+#[tauri::command]
+fn run_done_status(run_id: String, group_id: Option<String>) -> Result<Option<serde_json::Value>, String> {
+    let gid = group_id.unwrap_or_else(|| active_group_id().unwrap_or_default());
+    let mut candidates = vec![run_artifact_path(&gid, &run_id, "done")];
+    if !gid.is_empty() {
+        candidates.push(run_artifact_path("", &run_id, "done")); // legacy/flat
+    }
+    for path in &candidates {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            let v = serde_json::from_str::<serde_json::Value>(&txt).unwrap_or_else(|_| {
+                // A complete tombstone always parses (atomic write). A parse
+                // failure here is genuine corruption — still un-stick the UI, but
+                // signal it was abnormal rather than reporting a clean "stopped".
+                serde_json::json!({ "runId": run_id, "exitCode": null, "waitError": "completion record unreadable" })
+            });
+            // Only accept a tombstone whose embedded runId matches what we asked
+            // for — guards against a stray/legacy flat file for a different run.
+            if v.get("runId").and_then(|r| r.as_str()) == Some(run_id.as_str()) {
+                return Ok(Some(v));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A1b — delete a run's completion tombstone once the GUI has finalized the run
+/// (via the live event or the watchdog) so tombstones don't accumulate.
+/// Idempotent — missing file is fine. `group_id` mirrors `run_done_status`.
+#[tauri::command]
+fn clear_run_done(run_id: String, group_id: Option<String>) -> Result<(), String> {
+    let gid = group_id.unwrap_or_else(|| active_group_id().unwrap_or_default());
+    for path in [
+        run_artifact_path(&gid, &run_id, "done"),
+        run_artifact_path("", &run_id, "done"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// A1b — delete orphaned completion tombstones in the active group's runs dir.
+/// Called once on GUI startup: no run can be live then, so every `.done` is a
+/// leftover from a prior session where the GUI died before clearing it. Bounds
+/// tombstone accumulation; never touches run records (`.json`) or `.cancel`.
+#[tauri::command]
+fn sweep_done_tombstones() -> Result<u32, String> {
+    let group_id = active_group_id().unwrap_or_default();
+    let runs_root = orchestrator_root().join("runs");
+    let dir = if group_id.is_empty() { runs_root } else { runs_root.join(&group_id) };
+    let mut removed = 0u32;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("done")
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -2806,6 +2927,9 @@ pub fn run() {
             cancel_run_soft,
             list_runs,
             get_run,
+            run_done_status,
+            clear_run_done,
+            sweep_done_tombstones,
             orchestrator_path,
             settings_get,
             settings_add_provider,
@@ -2931,6 +3055,49 @@ mod tests {
         std::fs::create_dir_all(&rd3).unwrap();
         assert_eq!(bundled_orchestrator_root(&rd3), None);
         let _ = std::fs::remove_dir_all(&rd3);
+    }
+
+    // A1b — the completion tombstone lands at runs/<group-id>/<run_id>.done
+    // (and the flat runs/<run_id>.done when no group is active), matching the
+    // record/.cancel layout so the GUI watchdog finds it.
+    #[test]
+    fn run_artifact_path_in_builds_grouped_and_flat() {
+        let root = std::env::temp_dir().join("ct_run_artifact");
+        assert_eq!(
+            run_artifact_path_in(&root, "crimeos", "abc", "done"),
+            root.join("crimeos").join("abc.done")
+        );
+        assert_eq!(
+            run_artifact_path_in(&root, "", "abc", "done"),
+            root.join("abc.done")
+        );
+    }
+
+    // A1b — the tombstone body serializes both terminal shapes (clean exit code
+    // vs. internal wait_error) and round-trips through disk back to the fields
+    // the GUI watchdog feeds into finishRun().
+    #[test]
+    fn done_tombstone_round_trips_through_disk() {
+        let pid = std::process::id();
+        let runs = std::env::temp_dir().join(format!("ct_done_rt_{pid}"));
+        let path = run_artifact_path_in(&runs, "g1", "run-xyz", "done");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        std::fs::write(&path, done_tombstone_body("run-xyz", Some(0), None)).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["runId"], "run-xyz");
+        assert_eq!(v["exitCode"], 0);
+        assert!(v["waitError"].is_null());
+
+        // internal-error variant: no exit code, carries a wait_error
+        std::fs::write(&path, done_tombstone_body("run-xyz", None, Some("wait failed: x"))).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v2["exitCode"].is_null());
+        assert_eq!(v2["waitError"], "wait failed: x");
+
+        let _ = std::fs::remove_dir_all(&runs);
     }
 
     // atomic_write must replace the target (incl. over an existing file) and

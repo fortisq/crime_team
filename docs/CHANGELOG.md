@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-01 — run-completion tombstone + GUI watchdog so a dropped done event can't hang the UI (FOLLOWUPS A1b)
+
+The single `orchestrator:done` event is what un-sticks the UI when a run ends. If it was dropped (webview reload race, a listener torn down for an instant, an emit error) the GUI spun on "running" forever — the only trace was a `tracing::error!`.
+
+- **Durable tombstone (Rust).** The done-handler now writes `runs/<group-id>/<run_id>.done` — `{ runId, exitCode, waitError }` — **before** emitting, via the existing `atomic_write` (temp + rename) so a poller never sees a torn file. The Rust handler fires on *process exit* regardless of whether the orchestrator wrote a clean record, so it's the authoritative "the run ended" signal.
+- **GUI watchdog.** `startDoneWatchdog(runId, groupId)` polls `run_done_status` immediately, then every 3 s; if the tombstone appears while the UI still thinks the run is live, it calls `finishRun` (which already back-fills the answer from `get_run`). `finishRun` is now idempotent (a `finished` guard) so a late live event + the watchdog can't double-finalize; it clears the tombstone on finish, and `sweep_done_tombstones` clears orphans at startup.
+- **Hardened against an 8-finding adversarial self-review** (a 3-lens review workflow → per-finding verification): the watchdog pins the run's group so a mid-run active-group switch can't mis-locate the tombstone (`run_done_status`/`clear_run_done` take an explicit `group_id`); `loadRun` stops the watchdog and marks a loaded historical record `finished` so navigating to history mid-run is clean; `run_done_status` validates the embedded `runId` and, on a (now-impossible) torn read, un-sticks the UI with an honest `waitError` rather than a false "stopped"; the watchdog's immediate first poll closes the run-finishes-before-first-tick window.
+- New commands `run_done_status` / `clear_run_done` / `sweep_done_tombstones` (registered). Tests `run_artifact_path_in_builds_grouped_and_flat`, `done_tombstone_round_trips_through_disk`. `cargo test --lib` → 13; `npm test` → 33; debug GUI launches and renders.
+
 ## 2026-06-01 — real NSIS installer: bundle the orchestrator, portable resolution, prereq banner (FOLLOWUPS B1/B2/B3)
 
 The desktop app can now be installed and run on a machine that isn't the dev checkout. **Ships unsigned, no auto-updater, graceful prerequisite check** (deliberate v1 scope).
