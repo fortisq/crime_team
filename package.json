@@ -1,7 +1,7 @@
 {
   "name": "crime-team-orchestrator",
   "version": "0.1.0",
-  "description": "Multi-agent orchestrator on top of OpenClaw — for the Crime OS · MERIDIAN//OS myproject project. Dispatches a task to a Producer agent, parses DISPATCH blocks, runs specialists in parallel, integrates replies.",
+  "description": "Multi-agent orchestrator on top of OpenClaw. Built for multi-project use: each project is a group with its own Producer and specialist roster. Dispatches a task to a Producer agent, parses DISPATCH blocks, runs specialists in parallel, integrates replies.",
   "private": true,
   "type": "module",
   "bin": {

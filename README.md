@@ -1,14 +1,14 @@
 # crime-team-orchestrator
 
-Multi-agent orchestrator on top of OpenClaw for the **Crime OS · MERIDIAN//OS** myproject project.
+Multi-agent orchestrator on top of OpenClaw. Built for multi-project use: each project is a **group** with its own Producer and specialist roster.
 
-You type one task. Producer plans. Specialists run in **parallel**. Producer integrates. You get one answer.
+You type one task. The Producer plans. Specialists run in **parallel**. The Producer integrates their replies. You get one answer.
 
-Replaces the older PowerShell wrapper at `~/.openclaw/bin/crime-team.ps1` with a TypeScript service that:
-- Uses Node's `child_process.spawn` (better argv handling than PowerShell + cmd)
+A TypeScript engine driving OpenClaw subprocesses, that:
+- Uses Node's `child_process.spawn` (better argv handling than a PowerShell + cmd wrapper)
 - Runs specialists concurrently (`Promise.all` with bounded `maxParallel`)
 - Honors per-agent timeouts (defaults: 30 min for architect/frontend/security, 20 min for qa/art-director/producer; 30 min fallback)
-- Persists every run to `runs/<group-id>/<runId>.json` for review or future resume
+- Persists every run to `runs/<group-id>/<runId>.json` for review or re-run
 - Auto-truncates oversize messages with a marker (instead of crashing)
 
 ## Install
@@ -26,13 +26,23 @@ npm link            # makes `crime-team` available globally on PATH
 
 ```bash
 # basic
-crime-team "Survey the existing admin code in myproject — list every reducer, route, and component touched by admin functions. No changes proposed."
+crime-team "Audit the existing auth code — list every file, function, and route touched by auth logic. No changes proposed."
 
 # verbose: print specialist replies as they land
 crime-team "..." --verbose
 
+# let the Producer pick who runs (smart dispatch); hand the audit to a Coder
+# agent that applies the findings, re-auditing up to 3 times
+crime-team "..." --smart-dispatch --use-coder --loop 3
+
+# run a different group for this one invocation (one-shot; not persisted)
+crime-team "..." --group <group-id>
+
 # override timeout (default 30 min per call; per-role defaults in src/config.ts)
 crime-team "..." --timeout 1800
+
+# emit only the structured NDJSON event stream (for piping/automation)
+crime-team "..." --json
 
 # help
 crime-team --help
@@ -95,8 +105,8 @@ Drop a `.crime-team.json` in your CWD to set per-group thinking levels (and, opt
 ## Requires
 
 - Node.js 18+ (you have 22+). If `node` isn't on PATH (nvm/Volta/fnm, or the GUI launched from a shortcut), set `CRIME_TEAM_NODE=<full path to node>` — both the CLI orchestrator and the desktop app honor it.
-- OpenClaw installed with the active group's team configured. The dispatched roster is whatever is in that group's `specialists[]` in `~/.crime-team/groups.json` and **varies per project** (Crime OS ships 5 — architect / frontend / art-director / qa / security — plus the producer). The 6 names in `src/config.ts` `DEFAULT_PER_AGENT` are **timeout fallbacks only**, not the dispatch list — editing them does not change who runs. See `~\.openclaw\team-prompts\HOW-TO.md`.
-- `openclaw.cmd` discoverable on PATH (default install puts it at `%APPDATA%\npm\openclaw.cmd`). Override with `OPENCLAW_BIN=...` env var.
+- OpenClaw installed with the active group's team configured. The dispatched roster is whatever is in that group's `specialists[]` in `~/.crime-team/groups.json` and **varies per project** (a typical roster is the producer plus a handful of specialists, e.g. architect / frontend / art-director / qa / security). The 6 names in `src/config.ts` `DEFAULT_PER_AGENT` are **timeout fallbacks only**, not the dispatch list — editing them does not change who runs. See `~\.openclaw\team-prompts\HOW-TO.md`.
+- OpenClaw is invoked as `node openclaw.mjs` directly — **not** the `.cmd` shim (which `spawn` can't launch on Windows: `shell:false` → EINVAL). The default is `%APPDATA%\npm\node_modules\openclaw\openclaw.mjs`; override the path with `OPENCLAW_BIN=<path-to-openclaw.mjs>`.
 
 ## Desktop GUI
 
@@ -173,6 +183,7 @@ Behaviors the orchestrator enforces that aren't visible from the CLI flags — t
 
 - **Run records live under `runs/<group-id>/<runId>.json`** — not `runs/<runId>.json`. Every run is scoped to the active group (`config.ts` → `runsDir: runs/<group-id>`). The #1 "why isn't my run showing?" cause is looking in the wrong group's subfolder.
 - **Soft-cancel via a `.cancel` marker.** The GUI's Cancel (command `cancel_run_soft`) writes `runs/<group-id>/<runId>.cancel`. The orchestrator polls for it between loop iterations and before the Coder phase, then exits cleanly instead of hard-killing. CLI users can stop a `--loop` run cleanly by creating that file by hand; the orchestrator deletes it on the way out. (`src/orchestrator.ts`.) For the GUI this only works because `run_task` now passes its run UUID through as `--run-id`, so the marker it writes is the one the orchestrator polls — previously the two used different ids and GUI soft-cancel silently did nothing.
+- **Completion tombstone (`.done`) — the GUI's safety net.** When the orchestrator *process* exits, the desktop shell (not the engine) writes `runs/<group-id>/<runId>.done`. The GUI watchdog polls it (every 3 s) and finalizes the run from it if the live `orchestrator:done` event was ever dropped — so a missed event can't strand the UI on "running" forever. The GUI clears the tombstone on finish and sweeps orphans at startup; it's GUI-only and the engine never reads it. (`desktop/src-tauri/src/lib.rs`, `desktop/src/main.js`.)
 - **`.salvage/` directories are recovery dumps.** A `runs/<group-id>/<runId>.salvage/` folder holds loose-file copies of one run — `00-task.md` (the task) plus one `ok-<agent>.md` per successful specialist reply. The authoritative record is still the sibling `<runId>.json`, which already contains the task and every reply; the `.salvage/` dump is derived and safe to delete (you only lose the loose copies). To actually re-integrate a run that died mid-integration (e.g. a Defender/EPERM block in Phase 3), run `node scripts/salvage-integrate.mjs <runId>` — note it reads the **`.json` record**, *not* the `.salvage/` dir, and writes `finalAnswer` back.
 - **Dispatch is an enforced wire protocol.** Producer requests specialists by emitting blocks in this exact grammar:
 
