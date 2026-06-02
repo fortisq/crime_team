@@ -238,7 +238,25 @@ fn bundled_orchestrator_root(resource_dir: &std::path::Path) -> Option<PathBuf> 
     None
 }
 
+/// Strip Windows' verbatim (`\\?\`) path prefix. Tauri's `resource_dir()`
+/// returns it, but Node's main-module resolver (`realpathSync`) chokes on it —
+/// `node \\?\C:\…\crime-team.mjs` dies with `EISDIR: lstat 'C:'` — so every path
+/// we hand to `node` (the script AND the cwd) must be plain. Maps
+/// `\\?\UNC\host\share` → `\\host\share` and `\\?\C:\…` → `C:\…`; leaves an
+/// already-plain path untouched (so it's a no-op in dev / on non-Windows).
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    match p.to_str() {
+        Some(s) if s.starts_with(r"\\?\UNC\") => PathBuf::from(format!(r"\\{}", &s[r"\\?\UNC\".len()..])),
+        Some(s) if s.starts_with(r"\\?\") => PathBuf::from(&s[r"\\?\".len()..]),
+        _ => p,
+    }
+}
+
 fn orchestrator_root() -> PathBuf {
+    strip_verbatim_prefix(orchestrator_root_raw())
+}
+
+fn orchestrator_root_raw() -> PathBuf {
     let has_bin = has_orchestrator_bin;
 
     // 1. Explicit override.
@@ -3055,6 +3073,26 @@ mod tests {
         std::fs::create_dir_all(&rd3).unwrap();
         assert_eq!(bundled_orchestrator_root(&rd3), None);
         let _ = std::fs::remove_dir_all(&rd3);
+    }
+
+    // B1 hotfix — the verbatim `\\?\` prefix Tauri's resource_dir() returns
+    // crashes `node` (EISDIR on 'C:'); orchestrator_root() must strip it before
+    // any path is handed to node as the script/cwd.
+    #[test]
+    fn strip_verbatim_prefix_unwraps_tauri_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\app\_up_\_up_")),
+            PathBuf::from(r"C:\app\_up_\_up_")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share\app")),
+            PathBuf::from(r"\\srv\share\app")
+        );
+        // already-plain (dev / non-Windows) is untouched
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\plain\path")),
+            PathBuf::from(r"C:\plain\path")
+        );
     }
 
     // A1b — the completion tombstone lands at runs/<group-id>/<run_id>.done

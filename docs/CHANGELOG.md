@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-02 — hotfix: installed app crashed at every run (`EISDIR: lstat 'C:'`)
+
+The B1/B3 distribution work shipped a release/installed app that **could not run a task at all**. `orchestrator_root()` returned the value of Tauri's `resource_dir()`, which on Windows is a **verbatim** path (`\\?\C:\…`). `run_task` then spawned `node \\?\C:\…\bin\crime-team.mjs`, and Node's main-module resolver (`realpathSync`) chokes on the `\\?\` prefix — `Error: EISDIR: illegal operation on a directory, lstat 'C:'` — before any engine code runs.
+
+- **Fix:** `orchestrator_root()` now strips the verbatim prefix (`strip_verbatim_prefix`: `\\?\C:\…` → `C:\…`, `\\?\UNC\h\s` → `\\h\s`) so every path handed to `node` (script + cwd) is plain. Dev builds were unaffected (they resolve the root via the CWD walk, which is already plain) — the bug was release/installed-only, which is why it slipped past the earlier "renders + resolves" check.
+- **Now actually verified end-to-end:** reproduced the exact crash with a `\\?\` script path, then replicated `run_task`'s spawn (plain bundled bin + bundled cwd) and confirmed the engine launches and runs (emits `run_started` → `plan`, spawns openclaw) with no EISDIR. New `cargo test` `strip_verbatim_prefix_unwraps_tauri_paths`; `cargo test --lib` → 14. Release exe + NSIS installer rebuilt.
+
 ## 2026-06-01 — real, phase-skipping `--resume` (was a documented no-op)
 
 `--resume <id>` was wired but did nothing useful — it just reused the id for a from-scratch run that **overwrote** the saved record (a footgun: resuming a finished run destroyed it). It now actually resumes.
