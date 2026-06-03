@@ -13,6 +13,10 @@ runs/
 .crime-team.local.json
 *.log
 
+# Local Claude Code settings (may contain machine-specific paths)
+.claude/settings.json
+.claude/settings.local.json
+
 # Secrets — should never exist anyway; belt + suspenders
 .env
 .env.*

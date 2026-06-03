@@ -1,13 +1,5 @@
 {
   "perGroupThinking": {
-    "myproject": {
-      "cyberspace-3d": "medium",
-      "game-engine": "high",
-      "os-frontend": "medium",
-      "platform-auth": "high",
-      "producer": "max",
-      "sandbox-dsl": "high"
-    },
     "crime-team-orchestra": {
       "coder": "max",
       "producer": "max",
@@ -23,19 +15,6 @@
       "producer": "high",
       "qa": "medium",
       "security": "high"
-    },
-    "myproject": {
-      "backend-srv": "high",
-      "build-ops": "medium",
-      "coder": "max",
-      "content-bp": "medium",
-      "gameplay-cpp": "high",
-      "level-design": "medium",
-      "music-sfx": "medium",
-      "netcode": "high",
-      "producer": "max",
-      "qa": "medium",
-      "ux-ui": "medium"
     }
   }
 }

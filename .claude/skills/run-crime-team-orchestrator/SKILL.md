@@ -92,7 +92,7 @@ CI runs the Node side on push/PR via `.github/workflows/ci.yml` (`npm ci` → `n
 
 - **`dist/` shadows `src/`.** `bin/crime-team.mjs` runs `dist/cli.js` if it exists, else `tsx src/cli.ts`. So editing `src/` changes nothing for the CLI *or the GUI* until you `npm run build`. The driver rebuilds with `--build`.
 - **Screenshotting WebView2 needs `PrintWindow(h, hdc, 2)`, not `CopyFromScreen`.** Screen-coordinate capture grabbed whatever window was on top (first attempt photographed a browser). `PW_RENDERFULLCONTENT` (flag `2`) captures the window's own surface regardless of z-order; `SetForegroundWindow` is unreliable and unneeded.
-- **The Rust GUI hardcodes `C:\Users\user\Projects\crime-team-orchestrator`** as the orchestrator root (`orchestrator_root()` in `desktop/src-tauri/src/lib.rs`). Move the repo and the GUI can't find `bin/crime-team.mjs` or `runs/`.
+- **The Rust GUI hardcodes the orchestrator root path** as the orchestrator root (`orchestrator_root()` in `desktop/src-tauri/src/lib.rs`). Move the repo and the GUI can't find `bin/crime-team.mjs` or `runs/`.
 - **Runs are group-scoped: `runs/<group-id>/<runId>.json`**, never `runs/<runId>.json`. The active group here is `crime-team-orchestra`.
 - **`thinking: "max"` silently clamps to `"high"` on non-Opus agents** and only warns to stderr (`clampThinking` in `src/agent.ts`) — invisible in the GUI.
 
