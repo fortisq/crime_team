@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Multi-agent orchestrator on top of OpenClaw. Built for multi-project use: each project is a group with its own Producer and specialist roster. Dispatches a task to a Producer agent, parses DISPATCH blocks, runs specialists in parallel, integrates replies.",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "bin": {
     "crime-team": "./bin/crime-team.mjs"
