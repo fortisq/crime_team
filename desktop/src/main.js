@@ -1996,6 +1996,7 @@ const wizEls = {
   producerModel:    document.getElementById("wzProducerModel"),
   producerThinking: document.getElementById("wzProducerThinking"),
   maxSpecialists:   document.getElementById("wzMaxSpecialists"),
+  includeCoder:     document.getElementById("wzIncludeCoder"),
   // step 3
   scanProgress: document.getElementById("wzScanProgress"),
   scanPhase:    document.getElementById("wzScanPhase"),
@@ -2297,6 +2298,24 @@ async function submitCreate() {
       await invoke("groups_set_presets", { groupId: spec.id, presets: BUNDLED_PRESETS });
     } catch (seedErr) {
       console.warn(`failed to seed presets for new group '${spec.id}':`, seedErr);
+    }
+    // Optionally add a Coder agent. Reuses the exact settings-panel path
+    // (groups_generate_coder_prompt → groups_add_specialist kind:"coder"), which
+    // stamps coderAgentId and enforces at-most-one — so the "a Coder exists"
+    // detection is identical to a Coder added later via Edit Group.
+    if (wizEls.includeCoder?.checked) {
+      try {
+        wizEls.createPhase.textContent = "Coder: Producer drafting its prompt (~30–90s)…";
+        const coderBrief = "Apply the audit's findings as small, focused, reviewable changes. Read each file fully before editing. Prefer minimal diffs; do not refactor beyond the stated findings. Never touch auth/identity/secret files. End every reply with a touched-files summary.";
+        const coderPrompt = await invoke("groups_generate_coder_prompt", { groupId: spec.id, brief: coderBrief });
+        wizEls.createPhase.textContent = "Coder: creating agent…";
+        await invoke("groups_add_specialist", {
+          groupId: spec.id,
+          spec: { id: "coder", emoji: "🛠", model: "anthropic/claude-opus-4-7", thinking: "max", systemPrompt: coderPrompt, kind: "coder" },
+        });
+      } catch (coderErr) {
+        showBanner(`Team created, but the Coder agent couldn't be added: ${String(coderErr).slice(0, 160)}. Add it later via Edit Group → “+ Add a specialist” → tick “Coder agent”.`, "warn");
+      }
     }
     wizEls.createPhase.textContent = "done. switching to new group…";
     if (wizState.scanListener) { try { wizState.scanListener(); } catch {} }

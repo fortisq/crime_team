@@ -321,6 +321,10 @@
               </label>
             </div>
             <p class="muted">Scan reads CLAUDE.md, README.md, manifests, and top-level directory listings — capped at ~24KB total. Cost is small. The Producer is always created; <b>Max specialists</b> caps how many additional agents the scan proposes (1–8).</p>
+            <label class="kind-toggle" id="wzIncludeCoderRow">
+              <input type="checkbox" id="wzIncludeCoder" />
+              <span><strong>Include a Coder agent</strong> <span class="muted">— a workspace-write specialist that turns the audit's findings into code changes (enables “Use Coder” + Loop on runs). At most one per team; the new Producer drafts its prompt at create time, so this adds ~30–90s.</span></span>
+            </label>
           </section>
 
           <!-- Step 3 — scan / proposal -->
