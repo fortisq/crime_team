@@ -1995,6 +1995,7 @@ const wizEls = {
   // step 2 fields
   producerModel:    document.getElementById("wzProducerModel"),
   producerThinking: document.getElementById("wzProducerThinking"),
+  maxSpecialists:   document.getElementById("wzMaxSpecialists"),
   // step 3
   scanProgress: document.getElementById("wzScanProgress"),
   scanPhase:    document.getElementById("wzScanPhase"),
@@ -2132,6 +2133,7 @@ async function runScan() {
       displayName: wizEls.name.value,
       model: wizEls.producerModel.value,
       thinking: wizEls.producerThinking.value,
+      maxSpecialists: Math.max(1, Math.min(8, Number(wizEls.maxSpecialists?.value) || 5)),
     });
     wizState.proposal = proposal;
     wizState.specialistOverrides = proposal.specialists.map(s => ({

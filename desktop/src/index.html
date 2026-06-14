@@ -316,8 +316,11 @@
               <label><span>Thinking</span>
                 <select id="wzProducerThinking"></select>
               </label>
+              <label><span>Max specialists</span>
+                <input id="wzMaxSpecialists" type="number" min="1" max="8" step="1" value="5">
+              </label>
             </div>
-            <p class="muted">Scan reads CLAUDE.md, README.md, manifests, and top-level directory listings — capped at ~24KB total. Cost is small.</p>
+            <p class="muted">Scan reads CLAUDE.md, README.md, manifests, and top-level directory listings — capped at ~24KB total. Cost is small. The Producer is always created; <b>Max specialists</b> caps how many additional agents the scan proposes (1–8).</p>
           </section>
 
           <!-- Step 3 — scan / proposal -->

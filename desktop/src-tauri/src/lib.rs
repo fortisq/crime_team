@@ -890,7 +890,12 @@ async fn groups_scan_project(
     display_name: String,
     model: String,
     thinking: String,
+    max_specialists: Option<u32>,
 ) -> Result<TeamProposal, String> {
+    // Operator-set cap on how many specialists the scan proposes (Producer is
+    // always created separately). Default 5 (the prior fixed behavior); clamped
+    // to a sane 1–8 so the meta-prompt + argv + create flow stay manageable.
+    let max_n = max_specialists.unwrap_or(5).clamp(1, 8) as usize;
     let ws_path = std::path::PathBuf::from(&workspace);
     if !ws_path.exists() || !ws_path.is_dir() {
         return Err(format!("workspace does not exist or is not a directory: {workspace}"));
@@ -947,7 +952,7 @@ async fn groups_scan_project(
 
     let mut prompt = String::with_capacity(20000);
     prompt.push_str(&format!(
-"You are designing an agent team for a software project. Each team has a Producer (already chosen by the operator) plus 2-5 specialists tailored to THIS project. Propose only the specialists.\n\n\
+"You are designing an agent team for a software project. Each team has a Producer (already chosen by the operator) plus up to {max_n} specialists tailored to THIS project. Propose only the specialists.\n\n\
 PROJECT INFO\n────────────\n\
 Display name: {display_name}\n\
 Workspace:    {workspace}\n\n\
@@ -966,11 +971,11 @@ CONTEXT FILES\n─────────────\n\
     };
 
     prompt.push_str(&format!(
-"TASK\n────\nPropose 2-5 specialist agents tailored to THIS project. For each:\n  1. A short id (kebab-case, no spaces, 3-15 chars).\n  2. A one-word emoji.\n  3. A 1-sentence role description.\n  4. Why this project needs this role (cite paths or files from the context above).\n  5. Suggested model from: anthropic/claude-opus-4-7, anthropic/claude-sonnet-4-6, google/gemini-2.5-pro, google/gemini-2.5-flash, deepseek/deepseek-v4-pro, deepseek/deepseek-v4-flash, openrouter/google/gemma-4-31b-it:free\n  6. Suggested thinking level: off | low | medium | high | max\n  7. A complete system prompt for this agent (~1500-3000 chars). Include: role, owned domain (cite specific paths from the workspace), what to always read first, invariants, voice. NO scaffolding: do NOT include any 'Hey I just came online' opener or ask to be named.\n\n\
+"TASK\n────\nPropose up to {max_n} specialist agents tailored to THIS project (fewer is fine — match the project's actual scope). For each:\n  1. A short id (kebab-case, no spaces, 3-15 chars).\n  2. A one-word emoji.\n  3. A 1-sentence role description.\n  4. Why this project needs this role (cite paths or files from the context above).\n  5. Suggested model from: anthropic/claude-opus-4-7, anthropic/claude-sonnet-4-6, google/gemini-2.5-pro, google/gemini-2.5-flash, deepseek/deepseek-v4-pro, deepseek/deepseek-v4-flash, openrouter/google/gemma-4-31b-it:free\n  6. Suggested thinking level: off | low | medium | high | max\n  7. A complete system prompt for this agent (~1500-3000 chars). Include: role, owned domain (cite specific paths from the workspace), what to always read first, invariants, voice. NO scaffolding: do NOT include any 'Hey I just came online' opener or ask to be named.\n\n\
 {exemplar_block}\
 OUTPUT FORMAT (STRICT)\n──────────────────────\nReturn ONLY a JSON object — no prose before or after, optionally inside a single ```json code fence. Schema:\n\n\
 {{\n  \"rationale\": \"<1-2 sentences on why this team for this project>\",\n  \"specialists\": [\n    {{\n      \"id\": \"<id>\",\n      \"emoji\": \"<emoji>\",\n      \"role\": \"<1 sentence>\",\n      \"reasoning\": \"<why this project needs this role; cite paths>\",\n      \"suggestedModel\": \"<provider/model>\",\n      \"suggestedThinking\": \"off|low|medium|high|max\",\n      \"systemPrompt\": \"<full multi-paragraph prompt>\"\n    }}\n  ]\n}}\n\n\
-RULES\n─────\n- DO NOT include Producer; that role is fixed.\n- DO NOT propose more than 5 specialists.\n- DO NOT add a security specialist unless this project handles real user data, auth, payments, or multi-user state — most solo projects do not need one.\n- Match dispatched specialists to the actual scope of the work. A CLI tool may need only 2 agents. A game may need 4 or 5.\n- Specialist ids must be unique within this team and kebab-case.\n- Prefer cheap models (deepseek/deepseek-v4-pro, anthropic/claude-sonnet-4-6) unless a role really needs Opus.\n"
+RULES\n─────\n- DO NOT include Producer; that role is fixed.\n- DO NOT propose more than {max_n} specialists.\n- DO NOT add a security specialist unless this project handles real user data, auth, payments, or multi-user state — most solo projects do not need one.\n- Match dispatched specialists to the actual scope of the work. A CLI tool may need only 2 agents. A game may need 4 or 5.\n- Specialist ids must be unique within this team and kebab-case.\n- Prefer cheap models (deepseek/deepseek-v4-pro, anthropic/claude-sonnet-4-6) unless a role really needs Opus.\n"
     ));
 
     emit_scan(&app, "calling-model", format!("calling {} ({} chars prompt)…", model, prompt.len()));
@@ -1023,10 +1028,11 @@ RULES\n─────\n- DO NOT include Producer; that role is fixed.\n- DO NOT
 
     // ─── 5. validate ────────────────────────────────────────────────────────
     if proposal.specialists.is_empty() {
-        return Err("model proposed 0 specialists; expected 2-5".into());
+        return Err(format!("model proposed 0 specialists; expected 1-{max_n}"));
     }
-    if proposal.specialists.len() > 5 {
-        proposal.specialists.truncate(5);
+    if proposal.specialists.len() > max_n {
+        emit_scan(&app, "parsing", format!("model proposed {} specialists; capping at {max_n}", proposal.specialists.len()));
+        proposal.specialists.truncate(max_n);
     }
     let mut seen = std::collections::HashSet::new();
     for s in proposal.specialists.iter_mut() {
